@@ -2,12 +2,16 @@
 // when FLASHTIER_ENABLE_CUDA=ON.
 //
 // Compares the driver-managed oversubscription path (cudaMallocManaged +
-// cudaMemPrefetchAsync) against FlashTier's explicit strategy. Uses the
-// same deterministic access pattern and working-set geometry as the
-// explicit oversubscription benchmark so the comparison is apples-to-apples
-// on the same machine.
+// optional cudaMemPrefetchAsync / cudaMemAdvise) against FlashTier's
+// explicit strategy. Uses the same deterministic access pattern and
+// working-set geometry as the explicit oversubscription benchmark so the
+// comparison is apples-to-apples on the same machine.
+//
+// Some WDDM drivers report managedMemory but reject prefetch/advice at
+// runtime; hint failures are recorded in UmResult, never silently
+// swallowed.
 
-#include "unified_memory.hpp"
+#include "flashtier/backends/unified_memory.hpp"
 
 #include <chrono>
 #include <cuda_runtime.h>
@@ -52,12 +56,15 @@ UmResult run_unified_memory_benchmark(int device_id, uint64_t working_set_bytes,
 
     void* ptr = nullptr;
     check_cuda(cudaMallocManaged(&ptr, working_set_bytes), "cudaMallocManaged");
-    // Ask the driver to keep the buffer near the device.
-    check_cuda(cudaMemAdvise(ptr, working_set_bytes,
-                             cudaMemAdviseSetPreferredLocation, device_id),
-               "cudaMemAdvise");
-    check_cuda(cudaMemPrefetchAsync(ptr, working_set_bytes, device_id),
-               "cudaMemPrefetchAsync");
+
+    // Best-effort driver hints; failures are recorded, not fatal. Some
+    // WDDM drivers reject these APIs even when managedMemory is set.
+    out.advice_used =
+        cudaMemAdvise(ptr, working_set_bytes,
+                      cudaMemAdviseSetPreferredLocation, device_id) == cudaSuccess;
+    out.prefetch_used =
+        cudaMemPrefetchAsync(ptr, working_set_bytes, device_id) == cudaSuccess;
+    cudaGetLastError();  // clear stale error state from failed hints
 
     const uint64_t page_count = working_set_bytes / page_size;
     const uint64_t ops = page_count * iterations;
@@ -72,9 +79,9 @@ UmResult run_unified_memory_benchmark(int device_id, uint64_t working_set_bytes,
             auto* dst = static_cast<uint64_t*>(ptr) + (p * (page_size / 8));
             *dst = v;
 
-            // Prefetch a few pages ahead.
+            // Prefetch a few pages ahead (best effort).
             const uint64_t ahead = p + prefetch_distance;
-            if (ahead < page_count) {
+            if (out.prefetch_used && ahead < page_count) {
                 cudaMemPrefetchAsync(static_cast<char*>(ptr) + ahead * page_size,
                                      page_size, device_id);
             }

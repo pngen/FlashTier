@@ -17,6 +17,8 @@ struct UmResult {
     uint64_t bytes_moved = 0;
     double bandwidth_gb_s = 0.0;
     uint64_t mismatches = 0;
+    bool advice_used = false;   // cudaMemAdvise succeeded on this platform
+    bool prefetch_used = false; // cudaMemPrefetchAsync succeeded on this platform
 };
 
 #if FLASHTIER_HAVE_CUDA
