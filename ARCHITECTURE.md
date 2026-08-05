@@ -1,7 +1,37 @@
 # FlashTier Architecture
 
-Version: 1.0 (v0.1.0 scope). This document describes the implemented runtime
-as shipped in v0.1. Future changes are tracked in ROADMAP.md.
+Version: 1.1 (v0.1.0 scope). This document describes the implemented
+runtime as shipped. Future changes are tracked in ROADMAP.md.
+
+## 0. Vendor-neutral accelerator contract
+
+The governed runtime never calls vendor APIs directly. All accelerator
+behavior sits behind `include/flashtier/backends/device_backend.hpp`:
+
+- opaque execution queues (streams) and events;
+- structured capability discovery (allocation, async copies, pinned host,
+  unified/shared memory, prefetch/advice, direct storage, peer-to-peer,
+  multi-device, event timing, limits, alignment, granularity);
+- typed error translation (CUDA errors map to `ErrorCode::Cuda`, other
+  backends to `ErrorCode::Device`);
+- a backend registry with compiled-backend listing, runtime availability
+  probes, explicit and automatic selection, deterministic order, and
+  per-backend failure isolation.
+
+Capabilities are discovered at runtime, never guessed from product names.
+The CUDA backend live-probes managed-memory prefetch/advice because some
+WDDM drivers report `managedMemory` but reject the hint APIs.
+
+Backends shipped in v0.1: `cuda` (validated on the RTX 5090), `cpu`
+(emulation), `level_zero` and `vulkan` (self-declared API surfaces resolved
+from runtime loaders; compile without SDKs), `hip` and `metal`
+(compile-gated). A backend is considered validated only after its
+conformance, transfer, oversubscription, integrity, budget, and shutdown
+tests pass on real hardware — see docs/validation-matrix.md.
+
+`Tier::Vram` remains the user-facing name for accelerator-local device
+memory across vendors (CUDA, HIP, Level Zero, Vulkan, Metal); it denotes
+device memory, not NVIDIA-only memory.
 
 ## 1. Memory tiers
 
@@ -95,10 +125,10 @@ Legal transitions (all others rejected):
 
 | From             | To                                    |
 |------------------|---------------------------------------|
-| Unallocated      | LoadingToVram, ResidentHost, ResidentNvme, Released |
+| Unallocated      | LoadingToVram, ResidentHost, ResidentVram, ResidentNvme, Released |
 | LoadingToVram    | ResidentVram, Error                   |
 | LoadingToHost    | ResidentHost, Error                   |
-| ResidentVram     | EvictingToHost, Error, Released       |
+| ResidentVram     | EvictingToHost, ResidentNvme, Error, Released |
 | ResidentHost     | LoadingToVram, EvictingToNvme, Error, Released |
 | ResidentNvme     | LoadingToHost, Error, Released        |
 | EvictingToHost   | ResidentHost, Error                   |
@@ -113,6 +143,9 @@ Notes:
 - Allocation into host is synchronous: `Unallocated → ResidentHost`.
 - Allocation into NVMe stages through host: `Unallocated → ResidentHost →
   EvictingToNvme → ResidentNvme`.
+- `ResidentVram → ResidentNvme` is the clean drop: the page has a valid
+  NVMe copy and no transfer is needed (single authority moves without a
+  copy).
 - There is no direct VRAM↔NVMe hop in v0.1; both directions route through
   the host staging tier by design.
 
