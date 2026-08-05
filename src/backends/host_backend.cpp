@@ -3,20 +3,12 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include "flashtier/backends/device_backend.hpp"
 #include "flashtier/error.hpp"
-
-#if FLASHTIER_HAVE_CUDA
-#include <cuda_runtime.h>
-#endif
 
 namespace flashtier {
 
-HostBackend::HostBackend()
-#if FLASHTIER_HAVE_CUDA
-    : cuda_pinned_(true)
-#endif
-{
-}
+HostBackend::HostBackend() = default;
 
 HostBackend::~HostBackend() = default;
 
@@ -26,39 +18,57 @@ void HostBackend::set_budget(uint64_t limit_bytes, double reserve_margin) {
     margin_ = reserve_margin;
 }
 
+void HostBackend::set_device_backend(DeviceBackend* backend) {
+    std::lock_guard lock(mu_);
+    device_ = backend;
+    // Capability queries can be expensive (e.g. a live driver probe on the
+    // CUDA backend); snapshot the pinned flag once instead of querying it
+    // on every allocation.
+    pinned_available_ = device_ != nullptr && device_->capabilities().pinned_host_allocation;
+}
+
+void* HostBackend::allocate_fallback(uint64_t bytes) {
+#if defined(_WIN32)
+    void* ptr = _aligned_malloc(bytes, 4096);
+#else
+    void* ptr = aligned_alloc(4096, bytes);
+#endif
+    if (ptr == nullptr) {
+        throw Error(ErrorCode::Internal, "aligned host allocation failed");
+    }
+    return ptr;
+}
+
+void HostBackend::free_fallback(void* ptr) {
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
+
 void* HostBackend::allocate(uint64_t bytes, bool pageable) {
-    (void)pageable;  // used only in CUDA builds
+    bool use_device_pinned = false;
     {
         std::lock_guard lock(mu_);
         const uint64_t usable = limit_ - static_cast<uint64_t>(static_cast<double>(limit_) * margin_);
         if (bytes > usable || used_ > usable - bytes) {
             return nullptr;  // budget breach; caller decides
         }
+        use_device_pinned = !pageable && pinned_available_;
     }
 
     void* ptr = nullptr;
-#if FLASHTIER_HAVE_CUDA
-    if (cuda_pinned_ && !pageable) {
-        cudaError_t e = cudaMallocHost(&ptr, bytes);
-        if (e != cudaSuccess) {
-            throw Error(ErrorCode::Cuda,
-                        "cudaMallocHost failed for pinned host memory",
-                        cudaGetErrorString(e));
-        }
-    } else
-#endif
-    {
-#if defined(_WIN32)
-        ptr = _aligned_malloc(bytes, 4096);
-#else
-        ptr = aligned_alloc(4096, bytes);
-#endif
-        if (ptr == nullptr) {
-            throw Error(ErrorCode::Internal, "aligned host allocation failed");
-        }
+    if (use_device_pinned) {
+        ptr = device_->allocate_host_pinned(bytes);
+    } else {
+        ptr = allocate_fallback(bytes);
     }
 
     std::lock_guard lock(mu_);
+    if (use_device_pinned) {
+        pinned_ptrs_.insert(ptr);
+    }
     used_ += bytes;
     high_water_ = std::max(high_water_, used_);
     return ptr;
@@ -66,21 +76,15 @@ void* HostBackend::allocate(uint64_t bytes, bool pageable) {
 
 void HostBackend::free(void* ptr, uint64_t bytes) {
     if (ptr == nullptr) return;
-#if FLASHTIER_HAVE_CUDA
-    if (cuda_pinned_) {
-        cudaError_t e = cudaFreeHost(ptr);
-        if (e != cudaSuccess) {
-            throw Error(ErrorCode::Cuda, "cudaFreeHost failed",
-                        cudaGetErrorString(e));
-        }
-    } else
-#endif
+    bool was_pinned = false;
     {
-#if defined(_WIN32)
-        _aligned_free(ptr);
-#else
-        std::free(ptr);
-#endif
+        std::lock_guard lock(mu_);
+        was_pinned = pinned_ptrs_.erase(ptr) != 0;
+    }
+    if (was_pinned) {
+        device_->free_host_pinned(ptr);
+    } else {
+        free_fallback(ptr);
     }
     std::lock_guard lock(mu_);
     used_ = (bytes >= used_) ? 0 : used_ - bytes;
@@ -105,6 +109,11 @@ uint64_t HostBackend::headroom() const noexcept {
 uint64_t HostBackend::high_water() const noexcept {
     std::lock_guard lock(mu_);
     return high_water_;
+}
+
+bool HostBackend::uses_pinned() const noexcept {
+    std::lock_guard lock(mu_);
+    return pinned_available_;
 }
 
 }  // namespace flashtier

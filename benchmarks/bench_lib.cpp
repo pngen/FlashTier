@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "flashtier/backends/backend_registry.hpp"
+#include "flashtier/backends/device_backend.hpp"
 #include "flashtier/backends/nvme_backend.hpp"
 #include "flashtier/bench.hpp"
 #include "flashtier/cli.hpp"
@@ -24,7 +26,6 @@
 
 #if FLASHTIER_HAVE_CUDA
 #include "flashtier/backends/unified_memory.hpp"
-#include "flashtier/backends/vram_backend.hpp"
 #endif
 
 namespace flashtier {
@@ -40,9 +41,32 @@ std::string temp_store_path(const char* tag) {
         .string();
 }
 
+// Resolve the device backend for a benchmark run (same rules as the
+// runtime: --backend explicit or automatic with cpu fallback). Never
+// throws for "cpu": returns a null backend, which means CPU-only mode.
+std::unique_ptr<DeviceBackend> resolve_bench_backend(const cli::Options& o,
+                                                     std::string& backend_name,
+                                                     std::string& reason) {
+    BackendRegistry& registry = BackendRegistry::instance();
+    std::string name = o.backend.empty() || o.backend == "auto"
+                           ? registry.select_automatic(reason)
+                           : o.backend;
+    if (!registry.has(name)) {
+        throw Error(ErrorCode::Config,
+                    "requested backend is not compiled into this build: " + name);
+    }
+    backend_name = name;
+    if (name == "cpu") {
+        reason = "cpu backend: CPU-only mode (no accelerator tier)";
+        return nullptr;
+    }
+    return registry.create(name);
+}
+
 struct BenchHeader {
     std::string device;
-    std::string gpu_cc;
+    std::string arch;
+    std::string backend;
     std::string os;
     std::string cpu;
 };
@@ -52,39 +76,47 @@ BenchHeader probe_header(const cli::Options& o) {
     BenchHeader h;
     h.os = info.os;
     h.cpu = info.cpu;
-    if (info.primary_gpu().cuda_available) {
-        h.device = info.primary_gpu().name;
-        h.gpu_cc = std::to_string(info.primary_gpu().major) + "." +
-                   std::to_string(info.primary_gpu().minor);
+    std::string reason;
+    std::unique_ptr<DeviceBackend> dev = resolve_bench_backend(o, h.backend, reason);
+    if (dev != nullptr) {
+        const std::vector<DeviceInfo> devices = dev->enumerate_devices();
+        if (!devices.empty()) {
+            const DeviceInfo& d = devices[static_cast<std::size_t>(
+                std::min(o.device_id, static_cast<int>(devices.size()) - 1))];
+            h.device = d.name;
+            h.arch = d.architecture;
+        } else {
+            h.device = "(backend '" + h.backend + "' compiled but no devices)";
+        }
     } else {
-        h.device = "(no CUDA GPU)";
+        h.device = "(no accelerator; CPU-only mode)";
     }
     return h;
 }
 
 void print_header(const char* name, const BenchHeader& h, const Config& cfg) {
     std::printf("=== FlashTier benchmark: %s ===\n", name);
-    if (h.gpu_cc.empty()) {
+    if (h.arch.empty()) {
         std::printf("device: %s\n", h.device.c_str());
     } else {
-        std::printf("device: %s (cc %s)\n", h.device.c_str(), h.gpu_cc.c_str());
+        std::printf("device: %s (arch %s)\n", h.device.c_str(), h.arch.c_str());
     }
     std::printf("os: %s | cpu: %s\n", h.os.c_str(), h.cpu.c_str());
     std::printf("config:\n%s\n", cfg.describe().c_str());
 }
 
 struct EffectiveBudgets {
+    std::string backend;       // resolved backend name ("" = none yet)
+    std::string device_name;
     uint64_t vram = 0;
     uint64_t host = 0;
     uint64_t nvme = 0;
     uint64_t free_vram = 0;
     uint64_t free_ram = 0;
     uint64_t free_disk = 0;
-    GpuInfo gpu;
+    bool device_shared_memory = false;
 };
 
-// Effective budgets for a benchmark with explicit safe-sizing checks:
-// refuses budgets that exceed detected free capacity.
 // Effective budgets for a benchmark with explicit safe-sizing checks:
 // refuses budgets that exceed detected free capacity, and caps automatic
 // defaults so local validation stays small and bounded. Explicit
@@ -98,25 +130,36 @@ EffectiveBudgets resolve_budgets(const cli::Options& o, double vram_fraction,
     EffectiveBudgets b;
     b.free_ram = info.free_ram_bytes;
     b.free_disk = info.disk_free_bytes;
-    b.gpu = info.primary_gpu();
 
-    if (o.no_cuda || !FLASHTIER_HAVE_CUDA || !b.gpu.cuda_available) {
-        b.vram = 0;
-    } else {
-        b.free_vram = b.gpu.free_bytes;
-        const uint64_t wanted =
-            o.vram_budget_bytes != 0
-                ? o.vram_budget_bytes
-                : std::min(
-                      static_cast<uint64_t>(static_cast<double>(b.free_vram) * vram_fraction),
-                      vram_cap_bytes);
-        if (wanted > b.free_vram) {
-            throw Error(ErrorCode::Budget,
-                        "requested VRAM budget exceeds free VRAM",
-                        "budget " + std::to_string(wanted) +
-                            " free " + std::to_string(b.free_vram));
+    std::string reason;
+    std::unique_ptr<DeviceBackend> dev = resolve_bench_backend(o, b.backend, reason);
+    if (dev != nullptr) {
+        const std::vector<DeviceInfo> devices = dev->enumerate_devices();
+        if (devices.empty()) {
+            b.vram = 0;
+        } else {
+            const int idx = std::min(o.device_id, static_cast<int>(devices.size()) - 1);
+            dev->open(idx);
+            b.free_vram = dev->free_memory();
+            b.device_name = devices[static_cast<std::size_t>(idx)].name;
+            b.device_shared_memory = devices[static_cast<std::size_t>(idx)].memory_shared;
+            const uint64_t wanted =
+                o.vram_budget_bytes != 0
+                    ? o.vram_budget_bytes
+                    : std::min(
+                          static_cast<uint64_t>(static_cast<double>(b.free_vram) * vram_fraction),
+                          vram_cap_bytes);
+            if (wanted > b.free_vram) {
+                throw Error(ErrorCode::Budget,
+                            "requested device-memory budget exceeds free device memory",
+                            "budget " + std::to_string(wanted) +
+                                " free " + std::to_string(b.free_vram));
+            }
+            b.vram = wanted;
+            dev->close();
         }
-        b.vram = wanted;
+    } else {
+        b.vram = 0;
     }
 
     b.host = o.host_budget_bytes != 0
@@ -170,6 +213,8 @@ std::vector<uint8_t> page_payload(uint64_t page_size, uint64_t seed, uint64_t pa
 double gbps(uint64_t bytes, double seconds) {
     return seconds > 0.0 ? static_cast<double>(bytes) / 1e9 / seconds : 0.0;
 }
+
+std::string yes_no_str(bool v) { return v ? "yes" : "no"; }
 
 // Bounded local-validation defaults. Multi-gigabyte hardware runs require
 // explicit --working-set / budget flags; defaults never scale with total
@@ -245,26 +290,80 @@ int run_tiers(const cli::Options& o) {
         rows.push_back({"host_memcpy", gbps(buf_bytes, best_us / 1e6), best_us});
     }
 
-#if FLASHTIER_HAVE_CUDA
-    if (!o.no_cuda && !h.gpu_cc.empty()) {
-        VramBackend vram(o.device_id);
-        vram.open();
-
-        const auto h2d = vram.measure_h2d(buf_bytes);
-        rows.push_back({"pinned_host->vram", h2d.bandwidth_gb_s, h2d.duration_us});
-
-        const auto d2h = vram.measure_d2h(buf_bytes);
-        rows.push_back({"vram->pinned_host", d2h.bandwidth_gb_s, d2h.duration_us});
-
-        void* pinned = nullptr;
-        cudaError_t ce = cudaMallocHost(&pinned, buf_bytes);
-        if (ce != cudaSuccess) {
-            std::fprintf(stderr, "flashtier: cudaMallocHost failed: %s\n",
-                         cudaGetErrorString(ce));
-            return cli::kExitFatal;
+    // Device tier rows through the vendor-neutral backend contract.
+    std::string backend_name;
+    std::string reason;
+    std::unique_ptr<DeviceBackend> dev = resolve_bench_backend(o, backend_name, reason);
+    if (dev != nullptr) {
+        const std::vector<DeviceInfo> devices = dev->enumerate_devices();
+        if (devices.empty()) {
+            dev.reset();
         }
+    }
+    if (dev != nullptr) {
+        const int idx = std::min(o.device_id, static_cast<int>(dev->enumerate_devices().size()) - 1);
+        dev->open(idx);
+        DeviceStream* stream = dev->create_stream();
+        DeviceEvent* ev_start = dev->create_event();
+        DeviceEvent* ev_end = dev->create_event();
+
+        // Pinned host buffer from the backend.
+        void* pinned = dev->allocate_host_pinned(buf_bytes);
         std::memset(pinned, 0x33, buf_bytes);
 
+        // 2. pinned host -> device
+        {
+            void* d = dev->allocate(buf_bytes);
+            double best_us = 0.0;
+            for (int i = 0; i < 8; ++i) {
+                if (dev->capabilities().event_timing) {
+                    dev->record_event(ev_start, stream);
+                    dev->async_copy_host_to_device(d, pinned, buf_bytes, stream);
+                    dev->record_event(ev_end, stream);
+                    dev->sync_stream(stream);
+                    const double us = dev->event_elapsed_us(ev_start, ev_end);
+                    if (i == 0 || us < best_us) best_us = us;
+                } else {
+                    const auto t0 = Clock::now();
+                    dev->async_copy_host_to_device(d, pinned, buf_bytes, stream);
+                    dev->sync_stream(stream);
+                    const double us =
+                        std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+                    if (i == 0 || us < best_us) best_us = us;
+                }
+            }
+            dev->free(d);
+            rows.push_back({"pinned_host->device", gbps(buf_bytes, best_us / 1e6), best_us});
+        }
+
+        // 3. device -> pinned host
+        {
+            void* d = dev->allocate(buf_bytes);
+            dev->async_copy_host_to_device(d, pinned, buf_bytes, stream);
+            dev->sync_stream(stream);
+            double best_us = 0.0;
+            for (int i = 0; i < 8; ++i) {
+                if (dev->capabilities().event_timing) {
+                    dev->record_event(ev_start, stream);
+                    dev->async_copy_device_to_host(pinned, d, buf_bytes, stream);
+                    dev->record_event(ev_end, stream);
+                    dev->sync_stream(stream);
+                    const double us = dev->event_elapsed_us(ev_start, ev_end);
+                    if (i == 0 || us < best_us) best_us = us;
+                } else {
+                    const auto t0 = Clock::now();
+                    dev->async_copy_device_to_host(pinned, d, buf_bytes, stream);
+                    dev->sync_stream(stream);
+                    const double us =
+                        std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+                    if (i == 0 || us < best_us) best_us = us;
+                }
+            }
+            dev->free(d);
+            rows.push_back({"device->pinned_host", gbps(buf_bytes, best_us / 1e6), best_us});
+        }
+
+        // NVMe store for the remaining paths.
         const std::string store_path = o.nvme_path.empty()
                                            ? temp_store_path("tiers")
                                            : o.nvme_path + "/ft-tiers-store.bin";
@@ -285,6 +384,7 @@ int run_tiers(const cli::Options& o) {
         std::sort(region.begin(), region.end());
         const uint64_t base = region.front();
 
+        // 4. host -> NVMe
         {
             double best_us = 0.0;
             for (int i = 0; i < 8; ++i) {
@@ -298,6 +398,7 @@ int run_tiers(const cli::Options& o) {
             rows.push_back({"host->nvme", gbps(buf_bytes, best_us / 1e6), best_us});
         }
 
+        // 5. NVMe -> host
         {
             double best_us = 0.0;
             for (int i = 0; i < 8; ++i) {
@@ -311,50 +412,54 @@ int run_tiers(const cli::Options& o) {
             rows.push_back({"nvme->host", gbps(buf_bytes, best_us / 1e6), best_us});
         }
 
+        // 6. full NVMe -> host -> device
         {
-            void* d = vram.alloc(buf_bytes);
+            void* d = dev->allocate(buf_bytes);
             double best_us = 0.0;
             for (int i = 0; i < 8; ++i) {
                 const auto t0 = Clock::now();
                 auto op = store.read_async(base, pinned, buf_bytes);
                 op->wait();
-                vram.async_h2d(d, pinned, buf_bytes, 0);
-                vram.sync(0);
+                dev->async_copy_host_to_device(d, pinned, buf_bytes, stream);
+                dev->sync_stream(stream);
                 const double us =
                     std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
                 if (i == 0 || us < best_us) best_us = us;
             }
-            vram.free(d);
-            rows.push_back({"nvme->host->vram (full)", gbps(buf_bytes, best_us / 1e6),
+            dev->free(d);
+            rows.push_back({"nvme->host->device (full)", gbps(buf_bytes, best_us / 1e6),
                             best_us});
         }
 
+        // 7. full device -> host -> NVMe
         {
-            void* d = vram.alloc(buf_bytes);
-            vram.fill_device_pattern(d, buf_bytes, 7, 0);
-            vram.sync_all();
+            void* d = dev->allocate(buf_bytes);
+            dev->async_copy_host_to_device(d, pinned, buf_bytes, stream);
+            dev->sync_stream(stream);
             double best_us = 0.0;
             for (int i = 0; i < 8; ++i) {
                 const auto t0 = Clock::now();
-                vram.async_d2h(pinned, d, buf_bytes, 0);
-                vram.sync(0);
+                dev->async_copy_device_to_host(pinned, d, buf_bytes, stream);
+                dev->sync_stream(stream);
                 auto op = store.write_async(base, pinned, buf_bytes);
                 op->wait();
                 const double us =
                     std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
                 if (i == 0 || us < best_us) best_us = us;
             }
-            vram.free(d);
-            rows.push_back({"vram->host->nvme (full)", gbps(buf_bytes, best_us / 1e6),
+            dev->free(d);
+            rows.push_back({"device->host->nvme (full)", gbps(buf_bytes, best_us / 1e6),
                             best_us});
         }
 
-        cudaFreeHost(pinned);
         store.close();
         NvmeBackend::destroy_file(store_path);
-        vram.close();
+        dev->free_host_pinned(pinned);
+        dev->destroy_event(ev_end);
+        dev->destroy_event(ev_start);
+        dev->destroy_stream(stream);
+        dev->close();
     } else
-#endif
     {
         // CPU-only (or --no-cuda): the NVMe rows still measure real storage;
         // the CUDA rows report an explicit unsupported result.
@@ -417,7 +522,7 @@ int run_tiers(const cli::Options& o) {
         if (r.gb_s > 0.0) {
             std::printf("  %-24s %8.2f GB/s  (%10.1f us)\n", r.path, r.gb_s, r.us);
         } else {
-            std::printf("  %-24s unsupported (CPU-only build)\n", r.path);
+            std::printf("  %-24s unsupported (no accelerator backend)\n", r.path);
         }
     }
     std::printf("Note: full-path rows include host staging; NVMe numbers depend on the backing volume.\n");
@@ -433,7 +538,7 @@ int run_oversubscription(const cli::Options& o) {
         resolve_budgets(o, 0.50, kBenchVramCap, kBenchHostCap, kBenchNvmeCap);
     if (b.vram == 0) {
         std::printf("=== FlashTier benchmark: oversubscription ===\n");
-        std::printf("note: no CUDA GPU tier available; oversubscription runs against the host budget\n");
+        std::printf("note: no accelerator backend available; oversubscription runs against the host budget\n");
         // CPU-only default: small bounded host budget so the working set
         // genuinely oversubscribes it and spills to NVMe.
         b.host = std::min(b.host, kBenchCpuHostBudget);
@@ -448,7 +553,7 @@ int run_oversubscription(const cli::Options& o) {
     const BenchHeader h = probe_header(o);
     print_header("oversubscription", h, cfg);
 
-    const auto validation = validate_config(cfg);
+    const auto validation = validate_config(cfg, BackendRegistry::instance().compiled_backends());
     if (!validation.ok) {
         for (const auto& e : validation.errors) {
             std::fprintf(stderr, "config: %s\n", e.c_str());
@@ -854,14 +959,29 @@ int run_sparse_experts(const cli::Options& o) {
 
 int run_unified_memory(const cli::Options& o) {
 #if FLASHTIER_HAVE_CUDA
-    SystemInfo info = probe_system(o.device_id, o.nvme_path);
-    if (o.no_cuda || !info.primary_gpu().cuda_available) {
+    // This comparison is CUDA-specific by definition (cudaMallocManaged
+    // vs FlashTier's explicit strategy); it requires the cuda backend.
+    std::string backend_name;
+    std::string reason;
+    std::unique_ptr<DeviceBackend> dev = resolve_bench_backend(o, backend_name, reason);
+    if (dev == nullptr || backend_name != "cuda") {
         std::printf("=== FlashTier benchmark: unified-memory ===\n");
-        std::printf("unsupported: requires a CUDA build and GPU (got CPU-only mode)\n");
+        std::printf("unsupported: requires the cuda backend with a GPU (selected: %s)\n",
+                    backend_name.c_str());
         return cli::kExitUnsupported;
     }
-    const GpuInfo gpu = info.primary_gpu();
-    if (!gpu.unified_memory) {
+    const std::vector<DeviceInfo> devices = dev->enumerate_devices();
+    if (devices.empty()) {
+        std::printf("=== FlashTier benchmark: unified-memory ===\n");
+        std::printf("unsupported: cuda backend compiled but no device available\n");
+        return cli::kExitUnsupported;
+    }
+    const int idx = std::min(o.device_id, static_cast<int>(devices.size()) - 1);
+    dev->open(idx);
+    const DeviceCapabilities caps = dev->capabilities();
+    const DeviceInfo& gpu = devices[static_cast<std::size_t>(idx)];
+    dev->close();
+    if (!caps.unified_memory) {
         std::printf("=== FlashTier benchmark: unified-memory ===\n");
         std::printf("unsupported: device %s reports no unified memory support\n",
                     gpu.name.c_str());
@@ -871,24 +991,24 @@ int run_unified_memory(const cli::Options& o) {
     const uint64_t vram_budget = o.vram_budget_bytes != 0
                                      ? o.vram_budget_bytes
                                      : std::min(
-                                           static_cast<uint64_t>(static_cast<double>(gpu.free_bytes) * 0.50),
+                                           static_cast<uint64_t>(static_cast<double>(gpu.free_memory) * 0.50),
                                            kBenchVramCap);
     // Bounded default (2 GiB max); larger runs require explicit sizes.
     const uint64_t ws = o.working_set_bytes != 0 ? o.working_set_bytes : vram_budget * 2;
-    if (ws > gpu.free_bytes) {
+    if (ws > gpu.free_memory) {
         std::fprintf(stderr,
-                     "flashtier: unified-memory working set %s exceeds free VRAM %s; "
+                     "flashtier: unified-memory working set %s exceeds free device memory %s; "
                      "this benchmark is bounded and refuses unsafe sizes\n",
                      bytesize_to_string(ws).c_str(),
-                     bytesize_to_string(gpu.free_bytes).c_str());
+                     bytesize_to_string(gpu.free_memory).c_str());
         return cli::kExitUsage;
     }
 
     std::printf("=== FlashTier benchmark: unified-memory ===\n");
-    std::printf("device: %s (cc %d.%d, UM=%s, CAM=%s)\n", gpu.name.c_str(), gpu.major,
-                gpu.minor, gpu.unified_memory ? "yes" : "no",
-                gpu.concurrent_managed_access ? "yes" : "no");
-    std::printf("working set: %s (2x of %s VRAM budget)\n",
+    std::printf("device: %s (arch %s, UM=%s, CAM=%s)\n", gpu.name.c_str(),
+                gpu.architecture.c_str(), yes_no_str(caps.unified_memory).c_str(),
+                yes_no_str(caps.concurrent_managed_access).c_str());
+    std::printf("working set: %s (2x of %s device-memory budget)\n",
                 bytesize_to_string(ws).c_str(), bytesize_to_string(vram_budget).c_str());
     std::printf("page size: %s, prefetch distance: %llu pages, iterations: %u, seed: %llu\n",
                 bytesize_to_string(o.page_size).c_str(),
@@ -902,6 +1022,9 @@ int run_unified_memory(const cli::Options& o) {
                 static_cast<unsigned long long>(um.ops), um.ops_per_s, um.duration_s,
                 bytesize_to_string(um.bytes_moved).c_str(), um.bandwidth_gb_s,
                 static_cast<unsigned long long>(um.mismatches));
+    std::printf("  driver hints: memory advice %s, prefetch %s "
+                "(WDDM drivers may reject these even when managed memory is reported)\n",
+                yes_no_str(um.advice_used).c_str(), yes_no_str(um.prefetch_used).c_str());
     if (um.mismatches != 0) {
         std::fprintf(stderr, "flashtier: unified memory benchmark found %llu mismatches\n",
                      static_cast<unsigned long long>(um.mismatches));
@@ -915,7 +1038,7 @@ int run_unified_memory(const cli::Options& o) {
     cfg.prefetch = PrefetchKind::Sequential;
     cfg.prefetch_depth = static_cast<uint32_t>(o.um_prefetch_pages);
     cfg.retain_store = false;
-    const auto validation = validate_config(cfg);
+    const auto validation = validate_config(cfg, BackendRegistry::instance().compiled_backends());
     if (!validation.ok) return cli::kExitUsage;
 
     const uint64_t ws_pages = ws / cfg.page_size;
@@ -932,7 +1055,11 @@ int run_unified_memory(const cli::Options& o) {
             const auto payload = page_payload(cfg.page_size, cfg.seed, ids[p].value);
             rt.write_page(ids[p], payload.data());
             if (p + 1 < ws_pages) {
-                rt.prefetch_sequential(ids[p + 1], cfg.prefetch_depth - 1);
+                // Clamp the sequential prefetch to the valid page range.
+                const uint64_t remaining = ws_pages - (p + 2) + 1;
+                const uint64_t count =
+                    std::min<uint64_t>(cfg.prefetch_depth - 1, remaining);
+                rt.prefetch_sequential(ids[p + 1], count);
             }
         }
     }
@@ -976,7 +1103,7 @@ int run_unified_memory(const cli::Options& o) {
 #else
     (void)o;
     std::printf("=== FlashTier benchmark: unified-memory ===\n");
-    std::printf("unsupported: requires a CUDA build (this binary was built CPU-only)\n");
+    std::printf("unsupported: requires the cuda backend compiled into this build\n");
     return cli::kExitUnsupported;
 #endif
 }

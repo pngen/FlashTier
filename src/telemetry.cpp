@@ -274,6 +274,10 @@ void TelemetryAggregator::record(const TelemetryEvent& ev) {
         ++ps.count;
         ps.total_us += ev.duration_us;
         if (ps.samples_us.size() < 1000000) ps.samples_us.push_back(ev.duration_us);
+
+        // Promotion/demotion tallies: device residency transitions.
+        if (ev.dst == Tier::Vram) ++agg_.total_promotions;
+        if (ev.src == Tier::Vram) ++agg_.total_demotions;
     }
 
     switch (ev.type) {

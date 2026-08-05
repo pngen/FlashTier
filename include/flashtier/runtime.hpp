@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "flashtier/allocator.hpp"
+#include "flashtier/backends/device_backend.hpp"
 #include "flashtier/backends/host_backend.hpp"
 #include "flashtier/backends/nvme_backend.hpp"
 #include "flashtier/backends/storage_backend.hpp"
@@ -23,19 +25,20 @@
 
 namespace flashtier {
 
-#if FLASHTIER_HAVE_CUDA
-class VramBackend;
-#endif
-
 // The governed three-tier runtime. Owns the page table, budgets, backends,
 // policy, planner, transfer engine, and telemetry.
+//
+// The device-memory tier (user-facing name Tier::Vram) is driven
+// exclusively through the vendor-neutral DeviceBackend contract; the
+// runtime contains no vendor API calls. See
+// include/flashtier/backends/device_backend.hpp.
 //
 // Concurrency model (bounded and explicit):
 //  - one state lock guards the page table, budgets, and queues;
 //  - a bounded worker pool (queue_depth threads) executes page-level
 //    transfer chains; chains never wait on other chains;
-//  - NVMe ops are async (IOCP / threaded); CUDA copies are async on
-//    dedicated streams with events;
+//  - device copies are async on a backend stream with events;
+//  - NVMe ops are async (IOCP / threaded);
 //  - deterministic shutdown: stop flag, drain, join, close backends.
 class Runtime {
 public:
@@ -45,8 +48,9 @@ public:
     Runtime(const Runtime&) = delete;
     Runtime& operator=(const Runtime&) = delete;
 
-    // Probe the machine, select the device, open backends and stores.
-    // Throws ErrorCode::Unsupported when required capabilities are missing.
+    // Probe the machine, select the device backend, open backends and
+    // stores. Throws ErrorCode::Unsupported when required capabilities are
+    // missing; throws ErrorCode::Config for invalid backend selection.
     void start();
     void shutdown();
 
@@ -63,7 +67,7 @@ public:
     void read_page(PageId id, void* out);
 
     // ---- residency control -------------------------------------------------
-    void promote(PageId id);                 // ensure resident in VRAM
+    void promote(PageId id);                 // ensure resident in device memory
     void demote_to_host(PageId id);          // ensure resident in host
     void demote_to_nvme(PageId id);          // ensure resident in NVMe
     void evict(PageId id);                   // demote to the cheapest tier
@@ -85,6 +89,11 @@ public:
     TelemetryAggregates aggregates() const;
     uint64_t access_sequence() const noexcept { return access_seq_.load(); }
 
+    // Selected device backend (null when the runtime runs host+NVMe only).
+    DeviceBackend* device_backend() const { return device_.get(); }
+    std::string selected_backend() const;
+    std::string backend_selection_reason() const { return backend_reason_; }
+
     uint64_t vram_used() const;
     uint64_t host_used() const;
     uint64_t nvme_used() const;
@@ -96,8 +105,10 @@ public:
     void emit_telemetry(TelemetryEvent ev);
     void flush_telemetry();
 
-    // GPU access for the tier benchmark (nullptr in CPU-only builds).
-    void* gpu_memory_handle(PageId id);
+    // Device-memory handle of a VRAM-resident page (for diagnostics).
+    void* device_memory_handle(PageId id);
+    // Historical alias kept for compatibility.
+    void* gpu_memory_handle(PageId id) { return device_memory_handle(id); }
 
 private:
     // ---- transfer chain steps (worker-executed) ---------------------------
@@ -112,8 +123,6 @@ private:
     // ---- helpers -----------------------------------------------------------
     void emit_event(TelemetryEvent ev);
     PageMetadata wait_settled(PageId id);
-    void* alloc_host_buffer(uint64_t bytes);
-    void free_host_buffer(void* ptr, uint64_t bytes);
     void mark_prefetched(PageId id);
     bool consume_prefetch_mark(PageId id);
     void remove_queued_prefetch(PageId id);
@@ -121,12 +130,16 @@ private:
                          uint64_t bytes, double us, const std::string& reason,
                          const std::string& path);
     void record_error(const Error& e);
-    void transition_page(PageId id, PageState to);
-    void fill_snapshot(TelemetryEvent& ev) const;
     void worker_loop();
     void submit_demand(PageId id, Tier target);
     void submit_prefetch(PageId id, Tier target);
     std::string transfer_path_str(Tier src, Tier dst) const;
+    bool vram_tier_exists() const;
+    void* device_alloc(std::size_t bytes);
+    void device_free(void* ptr);
+    void device_copy_h2d(void* dst, const void* src, std::size_t bytes);
+    void device_copy_d2h(void* dst, const void* src, std::size_t bytes);
+    void device_sync();
 
     // ---- members -----------------------------------------------------------
     Config cfg_;
@@ -143,9 +156,13 @@ private:
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Policy> policy_;
 
-#if FLASHTIER_HAVE_CUDA
-    std::unique_ptr<VramBackend> vram_;
-#endif
+    std::unique_ptr<DeviceBackend> device_;  // vendor-neutral accelerator
+    DeviceStream* device_stream_ = nullptr;  // runtime transfer stream
+    DeviceEvent* device_event_a_ = nullptr;  // timing events
+    DeviceEvent* device_event_b_ = nullptr;
+    std::string backend_name_;
+    std::string backend_reason_;
+
     std::unique_ptr<StorageBackend> nvme_;
     bool store_opened_ = false;
     std::string store_path_;

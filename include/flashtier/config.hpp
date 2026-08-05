@@ -29,6 +29,10 @@ const char* prefetch_kind_name(PrefetchKind kind) noexcept;
 bool prefetch_kind_from_name(std::string_view name, PrefetchKind& out) noexcept;
 
 struct Config {
+    // Device backend selection: "auto" (default), or an explicit backend
+    // name ("cuda", "hip", "level_zero", "vulkan", "metal", "cpu").
+    std::string backend = "auto";
+
     // Device
     int device_id = 0;
 
@@ -77,9 +81,11 @@ struct ConfigValidation {
     std::vector<std::string> errors;
 };
 
-// Validates ranges and internal consistency. Never guesses: malformed or
-// unsafe values are rejected.
-ConfigValidation validate_config(const Config& cfg) noexcept;
+    // Validates ranges and internal consistency. Never guesses: malformed or
+    // unsafe values are rejected. `known_backends` is a comma-separated list
+    // of compiled backend names used to validate Config::backend.
+    ConfigValidation validate_config(const Config& cfg,
+                                     const std::vector<std::string>& known_backends = {}) noexcept;
 
 // Strict byte-size parsing. Accepts an unsigned integer optionally followed
 // by a binary suffix: KiB, MiB, GiB, TiB (case-insensitive). Bare bytes are

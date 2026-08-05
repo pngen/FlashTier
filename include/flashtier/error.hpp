@@ -16,13 +16,15 @@ enum class ErrorCode : int {
     State = 4,
     Invariant = 5,
     Budget = 6,
-    Cuda = 7,
+    Cuda = 7,       // NVIDIA CUDA backend errors (historical name, retained)
     Io = 8,
     StoreCorrupt = 9,
     Unsupported = 10,
     Cancelled = 11,
     Integrity = 12,
     Internal = 13,
+    Device = 14,    // vendor-neutral device-backend errors (HIP, Level Zero,
+                    // Vulkan, Metal, ...)
 };
 
 const char* error_code_name(ErrorCode code) noexcept;

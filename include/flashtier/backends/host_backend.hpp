@@ -2,18 +2,23 @@
 
 #include <cstdint>
 #include <mutex>
+#include <unordered_set>
 
 #include "flashtier/tier.hpp"
 
 namespace flashtier {
 
+class DeviceBackend;
+
 // Pinned (or explicitly pageable) host memory backend.
 //
-// With CUDA available, allocations use cudaMallocHost (pinned). A pageable
-// fallback (aligned heap allocation) exists but is only used when
-// explicitly enabled via Config::use_pageable_fallback — it never silently
-// substitutes for pinned memory in performance claims. Telemetry records
-// which kind of host memory was used.
+// Pinned allocation comes from the active device backend's
+// allocate_host_pinned (CUDA, HIP, Level Zero, Vulkan, ...) when the
+// backend advertises it; otherwise an aligned heap fallback is used. A
+// pageable fallback exists but is only used when explicitly enabled via
+// Config::use_pageable_fallback — it never silently substitutes for pinned
+// memory in performance claims. Telemetry records which kind of host
+// memory was used. This class never calls vendor APIs directly.
 class HostBackend {
 public:
     HostBackend();
@@ -22,8 +27,12 @@ public:
     HostBackend(const HostBackend&) = delete;
     HostBackend& operator=(const HostBackend&) = delete;
 
-    // Configure the budget. Errors on negative reserve.
+    // Configure the budget.
     void set_budget(uint64_t limit_bytes, double reserve_margin);
+
+    // The device backend whose pinned allocator is used. Null disables
+    // pinned allocation (aligned heap fallback only).
+    void set_device_backend(DeviceBackend* backend);
 
     // Allocate `bytes` (already aligned to page size by the caller).
     // Returns nullptr on budget breach; throws Error on allocator failure.
@@ -35,15 +44,20 @@ public:
     uint64_t limit() const noexcept;
     uint64_t headroom() const noexcept;
     uint64_t high_water() const noexcept;
-    bool uses_pinned() const noexcept { return cuda_pinned_; }
+    bool uses_pinned() const noexcept;
 
 private:
+    void* allocate_fallback(uint64_t bytes);
+    void free_fallback(void* ptr);
+
     mutable std::mutex mu_;
+    DeviceBackend* device_ = nullptr;
+    bool pinned_available_ = false;  // snapshot taken at set_device_backend
     uint64_t limit_ = 0;
     uint64_t used_ = 0;
     uint64_t high_water_ = 0;
     double margin_ = 0.0;
-    bool cuda_pinned_ = false;
+    std::unordered_set<void*> pinned_ptrs_;  // allocations owned by the device backend
 };
 
 }  // namespace flashtier

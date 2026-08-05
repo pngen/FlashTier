@@ -20,6 +20,7 @@ constexpr int kExitIntegrity = 6;
 constexpr int kExitFatal = 7;
 
 struct Options {
+    std::string backend;       // "" = auto; explicit names: cuda, hip, level_zero, vulkan, metal, cpu
     int device_id = 0;
     uint64_t page_size = 2 * 1024 * 1024;
     uint64_t working_set_bytes = 0;

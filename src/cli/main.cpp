@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "flashtier/backends/backend_registry.hpp"
 #include "flashtier/bench.hpp"
 #include "flashtier/cli.hpp"
 #include "flashtier/config.hpp"
@@ -14,7 +15,6 @@
 
 #if FLASHTIER_HAVE_CUDA
 #include "flashtier/backends/unified_memory.hpp"
-#include "flashtier/backends/vram_backend.hpp"
 #endif
 
 using namespace flashtier;
@@ -27,7 +27,102 @@ std::string gb(double bytes) {
     return buf;
 }
 
-void print_inspect(const SystemInfo& info, int device_id) {
+std::string yes_no(bool v) { return v ? "yes" : "no"; }
+
+void print_device_line(const DeviceInfo& d) {
+    std::printf("    %-14s %-32s arch=%-10s discrete=%s shared_mem=%s total=%s free=%s\n",
+                d.id.c_str(), d.name.c_str(), d.architecture.c_str(),
+                yes_no(d.discrete).c_str(), yes_no(d.memory_shared).c_str(),
+                gb(static_cast<double>(d.total_memory)).c_str(),
+                gb(static_cast<double>(d.free_memory)).c_str());
+}
+
+void print_backends(const BackendRegistry& registry) {
+    std::printf("compiled backends: ");
+    std::string compiled;
+    for (const auto& b : registry.compiled_backends()) {
+        if (!compiled.empty()) compiled += ", ";
+        compiled += b;
+    }
+    std::printf("%s\n", compiled.empty() ? "(none)" : compiled.c_str());
+    for (const BackendStatus& status : registry.probe_all()) {
+        std::printf("  backend %-12s vendor=%-28s %s\n", status.name.c_str(),
+                    status.vendor.c_str(), status.available ? "available" : "unavailable");
+        if (!status.available) {
+            std::printf("    reason: %s\n",
+                        status.reason.empty() ? "(no devices)" : status.reason.c_str());
+        } else {
+            for (const auto& d : status.devices) {
+                print_device_line(d);
+            }
+        }
+    }
+}
+
+// Resolve the selected backend/device without opening anything (used by
+// inspect/capabilities). Returns the backend name; "cpu" means CPU-only.
+std::string resolve_selected_backend(const cli::Options& o, std::string& reason) {
+    BackendRegistry& registry = BackendRegistry::instance();
+    if (!o.backend.empty() && o.backend != "auto") {
+        if (!registry.has(o.backend)) {
+            throw Error(ErrorCode::Config,
+                        "requested backend is not compiled into this build: " + o.backend);
+        }
+        reason = "explicit --backend " + o.backend;
+        return o.backend;
+    }
+    return registry.select_automatic(reason);
+}
+
+void print_selected_device(const cli::Options& o) {
+    std::string reason;
+    const std::string backend = resolve_selected_backend(o, reason);
+    std::printf("selected backend: %s (%s)\n", backend.c_str(), reason.c_str());
+    if (backend == "cpu") {
+        std::printf("cpu-only fallback state: active (no accelerator tier; no GPU execution claimed)\n");
+        return;
+    }
+    std::printf("cpu-only fallback state: inactive\n");
+    BackendRegistry& registry = BackendRegistry::instance();
+    std::unique_ptr<DeviceBackend> dev = registry.create(backend);
+    const std::vector<DeviceInfo> devices = dev->enumerate_devices();
+    if (o.device_id >= static_cast<int>(devices.size())) {
+        std::printf("selected device: invalid index %d (available: %zu)\n", o.device_id,
+                    devices.size());
+        return;
+    }
+    const DeviceInfo& d = devices[static_cast<std::size_t>(o.device_id)];
+    std::printf("selected device: %s (%s)\n", d.id.c_str(), d.name.c_str());
+    std::printf("  architecture: %s | discrete: %s | shared memory: %s | total: %s\n",
+                d.architecture.c_str(), yes_no(d.discrete).c_str(),
+                yes_no(d.memory_shared).c_str(),
+                gb(static_cast<double>(d.total_memory)).c_str());
+    DeviceCapabilities caps = dev->probe_capabilities();
+    std::printf("  explicit allocation: %s | async H2D: %s | async D2H: %s | pinned host: %s\n",
+                yes_no(caps.explicit_allocation).c_str(),
+                yes_no(caps.async_host_to_device).c_str(),
+                yes_no(caps.async_device_to_host).c_str(),
+                yes_no(caps.pinned_host_allocation).c_str());
+    std::printf("  unified memory: %s | concurrent managed access: %s | prefetch: %s | advice: %s\n",
+                yes_no(caps.unified_memory).c_str(),
+                yes_no(caps.concurrent_managed_access).c_str(),
+                yes_no(caps.memory_prefetch).c_str(),
+                yes_no(caps.memory_advice).c_str());
+    std::printf("  direct storage: %s | p2p: %s | multi-device: %s | hw page faults: %s\n",
+                yes_no(caps.direct_storage).c_str(), yes_no(caps.peer_to_peer).c_str(),
+                yes_no(caps.multi_device).c_str(),
+                yes_no(caps.hardware_page_fault).c_str());
+    std::printf("  max allocation: %s | alignment: %llu | transfer granularity: %llu | queues: %u\n",
+                gb(static_cast<double>(caps.max_allocation_size)).c_str(),
+                static_cast<unsigned long long>(caps.alignment_bytes),
+                static_cast<unsigned long long>(caps.transfer_granularity),
+                caps.queue_count);
+    if (!caps.note.empty()) {
+        std::printf("  note: %s\n", caps.note.c_str());
+    }
+}
+
+void print_inspect(const SystemInfo& info, const cli::Options& o) {
     std::printf("=== FlashTier inspect ===\n");
     std::printf("build:        FlashTier %s (git %s)\n", FLASHTIER_VERSION,
                 FLASHTIER_GIT_REVISION);
@@ -36,84 +131,52 @@ void print_inspect(const SystemInfo& info, int device_id) {
     std::printf("system ram:   total %s free %s\n",
                 gb(static_cast<double>(info.total_ram_bytes)).c_str(),
                 gb(static_cast<double>(info.free_ram_bytes)).c_str());
-    if (info.gpus.empty()) {
-        std::printf("gpu:          none detected\n");
-    } else {
-        for (std::size_t i = 0; i < info.gpus.size(); ++i) {
-            const GpuInfo& g = info.gpus[i];
-            std::printf("gpu[%zu]:       %s (CUDA %s)\n", i, g.name.c_str(),
-                        g.cuda_available ? "available" : "unavailable");
-            if (g.cuda_available) {
-                std::printf("  compute capability: %d.%d\n", g.major, g.minor);
-                std::printf("  vram: total %s free %s\n",
-                            gb(static_cast<double>(g.total_bytes)).c_str(),
-                            gb(static_cast<double>(g.free_bytes)).c_str());
-                std::printf("  unified memory: %s\n", g.unified_memory ? "yes" : "no");
-                std::printf("  concurrent managed access: %s\n",
-                            g.concurrent_managed_access ? "yes" : "no");
-            }
-        }
+    std::printf("accelerators:\n");
+    print_backends(BackendRegistry::instance());
+    if (info.cuda_enabled && info.cuda_runtime_version != 0) {
+        std::printf("cuda runtime: version %d\n", info.cuda_runtime_version);
+        std::printf("cuda driver:  version %d\n", info.cuda_driver_version);
     }
-    std::printf("cuda runtime: %s\n",
-                info.cuda_runtime_version
-                    ? ("version " + std::to_string(info.cuda_runtime_version)).c_str()
-                    : "not available in this build");
-    std::printf("cuda driver:  %s\n",
-                info.cuda_driver_version
-                    ? ("version " + std::to_string(info.cuda_driver_version)).c_str()
-                    : "not available");
     std::printf("nvme path:    %s\n",
                 info.nvme_path.empty() ? "(temp dir)" : info.nvme_path.c_str());
     std::printf("disk:         total %s free %s\n",
                 gb(static_cast<double>(info.disk_total_bytes)).c_str(),
                 gb(static_cast<double>(info.disk_free_bytes)).c_str());
-    std::printf("directstorage:%s\n", info.directstorage_detected ? "probe present" : "not integrated (v0.1 probe)");
-    std::printf("gds:          %s\n", info.gds_detected ? "cuFile detected" : "not detected (Linux-first future backend)");
-    const GpuInfo primary = info.primary_gpu();
-    if (primary.cuda_available) {
-        std::printf("selected device: %s (device %d)\n", primary.name.c_str(), device_id);
-    }
+    std::printf("directstorage: %s\n",
+                info.directstorage_detected ? "probe present" : "not integrated (v0.1 probe)");
+    std::printf("gds:          %s\n",
+                info.gds_detected ? "cuFile detected" : "not detected (Linux-first future backend)");
+    print_selected_device(o);
     std::printf("=== end inspect ===\n");
 }
 
-void print_capabilities(const SystemInfo& info) {
+void print_capabilities(const SystemInfo& info, const cli::Options& o) {
     std::printf("=== FlashTier capabilities ===\n");
     std::printf("platform:     %s\n", info.os.c_str());
-    std::printf("cuda build:   %s\n", info.cuda_enabled ? "enabled" : "disabled (CPU-only)");
-    if (info.cuda_enabled) {
-        std::printf("gpu:          %s\n",
-                    info.primary_gpu().cuda_available ? info.primary_gpu().name.c_str()
-                                                      : "none available");
-        if (info.primary_gpu().cuda_available) {
-            const GpuInfo& g = info.primary_gpu();
-            std::printf("  compute capability: %d.%d\n", g.major, g.minor);
-            std::printf("  unified memory: %s\n", g.unified_memory ? "yes" : "no");
-            std::printf("  concurrent managed access: %s\n",
-                        g.concurrent_managed_access ? "yes" : "no");
-        }
-    }
-    std::printf("tiers:        vram / host_pinned / nvme\n");
-    std::printf("  vram:       %s\n",
-                info.primary_gpu().cuda_available ? "explicit CUDA allocations"
-                                                  : "unavailable in this build");
-    std::printf("  host:       %s\n", "pinned when CUDA present; pageable fallback only when explicitly enabled");
-    std::printf("  nvme:       %s\n", "file-backed store; Windows overlapped I/O (IOCP)");
+    std::printf("accelerators:\n");
+    print_backends(BackendRegistry::instance());
+    std::printf("tiers:        device (Tier::Vram) / host_pinned / nvme\n");
+    std::printf("  device:     driven through the vendor-neutral DeviceBackend contract\n");
+    std::printf("  host:       pinned via the active device backend; pageable fallback only "
+                "when explicitly enabled\n");
+    std::printf("  nvme:       file-backed store; Windows overlapped I/O (IOCP)\n");
     std::printf("policies:     lru (deterministic baseline), predictive (temperature-aware heuristic)\n");
     std::printf("prefetch:     off, sequential, predictive (bounded queue, cancellation)\n");
     std::printf("unified memory comparison benchmark: %s\n",
                 (info.cuda_enabled && info.primary_gpu().cuda_available &&
                  info.primary_gpu().unified_memory)
-                    ? "supported (bounded)"
+                    ? "supported (bounded, CUDA)"
                     : "not supported by this build/device");
     std::printf("directstorage: %s\n", "experimental probe only; no v0.1 integration");
     std::printf("gpudirect storage: %s\n", "interface-ready; Linux-first, not implemented in v0.1");
+    print_selected_device(o);
     std::printf("=== end capabilities ===\n");
 }
 
 int run_inspect(const cli::Options& o) {
     try {
         SystemInfo info = probe_system(o.device_id, o.nvme_path);
-        print_inspect(info, o.device_id);
+        print_inspect(info, o);
         return cli::kExitOk;
     } catch (const Error& e) {
         std::fprintf(stderr, "flashtier: inspect failed: %s\n", e.what());
@@ -124,7 +187,7 @@ int run_inspect(const cli::Options& o) {
 int run_capabilities(const cli::Options& o) {
     try {
         SystemInfo info = probe_system(o.device_id, o.nvme_path);
-        print_capabilities(info);
+        print_capabilities(info, o);
         return cli::kExitOk;
     } catch (const Error& e) {
         std::fprintf(stderr, "flashtier: capabilities failed: %s\n", e.what());
@@ -136,7 +199,7 @@ int run_verify(const cli::Options& o) {
     std::printf("=== FlashTier verify ===\n");
     Config cfg = o.to_config();
     try {
-        const auto v = validate_config(cfg);
+        const auto v = validate_config(cfg, BackendRegistry::instance().compiled_backends());
         if (!v.ok) {
             for (const auto& e : v.errors) std::fprintf(stderr, "config: %s\n", e.c_str());
             return cli::kExitUsage;

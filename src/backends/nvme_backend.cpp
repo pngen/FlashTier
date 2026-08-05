@@ -577,7 +577,15 @@ void NvmeBackend::close() {
 }
 
 void NvmeBackend::destroy_file(const std::string& path) {
-    DeleteFileA(path.c_str());
+    // Deletion can transiently fail with a sharing violation (antivirus
+    // scan, lazy handle teardown); bounded retry keeps shutdown honest
+    // without blind polling.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (DeleteFileA(path.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
 }
 
 #else  // POSIX (Linux)

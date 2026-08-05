@@ -8,19 +8,24 @@
 #   include(FlashTierWarnings)
 #   flashtier_apply_warnings(<target>)
 #
-# Honors the FLASHTIER_WARNINGS_AS_ERRORS option for native code. CUDA
-# translation units receive /W4 or -Wall -Wextra through nvcc.
+# Flags are scoped to CXX so nvcc never receives bare MSVC options; the
+# CUDA target passes its own flags through -Xcompiler.
+# Honors the FLASHTIER_WARNINGS_AS_ERRORS option.
 
 function(flashtier_apply_warnings TARGET)
   if(MSVC)
-    target_compile_options(${TARGET} PRIVATE /W4 /permissive- /Zc:__cplusplus)
+    target_compile_options(${TARGET} PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:/W4>
+      $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+      $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
     if(FLASHTIER_WARNINGS_AS_ERRORS)
-      target_compile_options(${TARGET} PRIVATE /WX)
+      target_compile_options(${TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/WX>)
     endif()
   else()
-    target_compile_options(${TARGET} PRIVATE -Wall -Wextra)
+    target_compile_options(${TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall>)
+    target_compile_options(${TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
     if(FLASHTIER_WARNINGS_AS_ERRORS)
-      target_compile_options(${TARGET} PRIVATE -Werror)
+      target_compile_options(${TARGET} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Werror>)
     endif()
   endif()
 endfunction()

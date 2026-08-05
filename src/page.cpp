@@ -33,8 +33,10 @@ bool transition_allowed(PageState from, PageState to) noexcept {
         case PageState::LoadingToHost:
             return to == PageState::ResidentHost || to == PageState::Error;
         case PageState::ResidentVram:
-            return to == PageState::EvictingToHost || to == PageState::Error ||
-                   to == PageState::Released;
+            // EvictingToHost = demotion with transfer; ResidentNvme = clean
+            // drop of a page whose NVMe copy is still valid (no transfer).
+            return to == PageState::EvictingToHost || to == PageState::ResidentNvme ||
+                   to == PageState::Error || to == PageState::Released;
         case PageState::ResidentHost:
             return to == PageState::LoadingToVram ||
                    to == PageState::EvictingToNvme || to == PageState::Error ||

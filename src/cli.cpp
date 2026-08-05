@@ -38,7 +38,9 @@ void print_usage(FILE* out) {
                  "  benchmark unified-memory   Compare explicit vs cudaMallocManaged\n"
                  "\n"
                  "Options:\n"
-                 "  --device <id>            CUDA device index (default 0)\n"
+                 "  --backend <name>         Device backend: auto (default), cuda, hip,\n"
+                 "                           level_zero, vulkan, metal, cpu\n"
+                 "  --device <id>            Device index within the backend (default 0)\n"
                  "  --page-size <bytes>      Page size (KiB/MiB/GiB/TiB suffixes)\n"
                  "  --working-set <bytes>    Logical working set\n"
                  "  --vram-budget <bytes>    VRAM budget (0 = auto)\n"
@@ -130,6 +132,25 @@ Options parse_args(int argc, char** argv) {
                     o.errors.push_back("--device expects a nonnegative integer");
                 } else {
                     o.device_id = static_cast<int>(n);
+                }
+            }
+        } else if (arg == "--backend") {
+            std::string v;
+            if (value_for("--backend", v)) {
+                const std::string known[] = {"auto", "cuda", "hip", "level_zero",
+                                             "vulkan", "metal", "cpu"};
+                bool ok = false;
+                for (const auto& k : known) {
+                    if (v == k) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if (!ok) {
+                    o.errors.push_back(
+                        "--backend: expected auto, cuda, hip, level_zero, vulkan, metal, or cpu");
+                } else {
+                    o.backend = v;
                 }
             }
         } else if (arg == "--page-size") {
@@ -288,6 +309,7 @@ Options parse_args(int argc, char** argv) {
 
 Config Options::to_config() const {
     Config c;
+    c.backend = backend;
     c.device_id = device_id;
     c.page_size = page_size;
     c.working_set_bytes = working_set_bytes;

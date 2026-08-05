@@ -11,12 +11,9 @@
 #include <optional>
 #include <vector>
 
+#include "flashtier/backends/backend_registry.hpp"
 #include "flashtier/error.hpp"
 #include "flashtier/integrity.hpp"
-
-#if FLASHTIER_HAVE_CUDA
-#include "flashtier/backends/vram_backend.hpp"
-#endif
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -65,53 +62,63 @@ Runtime::~Runtime() {
 // ---------------------------------------------------------------------------
 
 void Runtime::start() {
-    if (cfg_.cuda_enabled && !FLASHTIER_HAVE_CUDA) {
-        throw Error(ErrorCode::Unsupported,
-                    "this build has no CUDA support; rebuild with "
-                    "FLASHTIER_ENABLE_CUDA=ON or pass --no-cuda");
+    // ---- device backend selection ----------------------------------------
+    BackendRegistry& registry = BackendRegistry::instance();
+    std::string backend_name = cfg_.backend.empty() ? "auto" : cfg_.backend;
+    if (!cfg_.cuda_enabled) {
+        // --no-cuda requests CPU-only mode; contradicting explicit
+        // non-cpu backends are a configuration error.
+        if (!cfg_.backend.empty() && cfg_.backend != "auto" && cfg_.backend != "cpu") {
+            throw Error(ErrorCode::Config,
+                        "--no-cuda conflicts with explicit backend '" + cfg_.backend + "'");
+        }
+        backend_name = "cpu";
+        backend_reason_ = "cpu backend: CPU-only mode requested (--no-cuda)";
+    } else if (cfg_.backend.empty() || cfg_.backend == "auto") {
+        backend_name = registry.select_automatic(backend_reason_);
+    } else {
+        if (!registry.has(backend_name)) {
+            throw Error(ErrorCode::Config,
+                        "unknown device backend '" + backend_name + "'");
+        }
+        backend_reason_ = "explicit --backend " + backend_name;
     }
+    backend_name_ = backend_name;
 
     info_ = probe_system(cfg_.device_id, cfg_.nvme_path);
 
+    // CPU-only mode (backend "cpu") runs the host + NVMe tiers without an
+    // accelerator tier, exactly as before; no GPU execution is claimed.
+    const bool cpu_only_mode = backend_name == "cpu";
+
     uint64_t vram_limit = 0;
-#if FLASHTIER_HAVE_CUDA
-    if (cfg_.cuda_enabled) {
-        const GpuInfo gpu = info_.primary_gpu();
-        if (!gpu.cuda_available) {
+    DeviceInfo dev_info;
+    if (!cpu_only_mode) {
+        device_ = registry.create(backend_name);
+        device_->open(cfg_.device_id);
+        dev_info = device_->device_info();
+        const uint64_t free_device = device_->free_memory();
+        if (free_device == 0) {
             throw Error(ErrorCode::Unsupported,
-                        "no CUDA-capable GPU detected on the requested device");
-        }
-        vram_ = std::make_unique<VramBackend>(cfg_.device_id);
-        vram_->open();
-        const uint64_t free_vram = vram_->free_mem_bytes();
-        if (free_vram == 0) {
-            throw Error(ErrorCode::Unsupported,
-                        "cannot determine free VRAM; refusing to guess budgets");
+                        "cannot determine free device memory; refusing to guess budgets");
         }
         if (cfg_.vram_budget_bytes != 0) {
             vram_limit = round_down(cfg_.vram_budget_bytes, cfg_.page_size);
         } else {
             vram_limit = round_down(
-                static_cast<uint64_t>(static_cast<double>(free_vram) * cfg_.auto_vram_fraction),
+                static_cast<uint64_t>(static_cast<double>(free_device) * cfg_.auto_vram_fraction),
                 cfg_.page_size);
         }
-        if (vram_limit == 0) {
-            throw Error(ErrorCode::Budget, "effective VRAM budget is zero");
-        }
-        if (vram_limit > free_vram) {
+        if (vram_limit > free_device) {
             throw Error(ErrorCode::Budget,
-                        "VRAM budget exceeds currently free VRAM",
+                        "device-memory budget exceeds currently free device memory",
                         "budget " + std::to_string(vram_limit) +
-                            " free " + std::to_string(free_vram));
+                            " free " + std::to_string(free_device));
         }
+        device_stream_ = device_->create_stream();
+        device_event_a_ = device_->create_event();
+        device_event_b_ = device_->create_event();
     }
-#else
-    if (cfg_.cuda_enabled) {
-        throw Error(ErrorCode::Unsupported,
-                    "this build has no CUDA support; rebuild with "
-                    "FLASHTIER_ENABLE_CUDA=ON or pass --no-cuda");
-    }
-#endif
 
     const uint64_t host_limit =
         cfg_.host_budget_bytes != 0
@@ -121,6 +128,25 @@ void Runtime::start() {
                   cfg_.page_size);
     if (host_limit == 0) {
         throw Error(ErrorCode::Budget, "effective host budget is zero");
+    }
+
+    // Integrated / shared-memory accelerators share physical RAM with the
+    // host: never double-count the same memory, keep an OS reserve, and
+    // clamp the device budget so device + host budgets fit free RAM.
+    if (dev_info.memory_shared && vram_limit != 0) {
+        const uint64_t os_reserve = static_cast<uint64_t>(
+            static_cast<double>(info_.free_ram_bytes) * 0.10);
+        const uint64_t ram_room =
+            info_.free_ram_bytes > host_limit + os_reserve
+                ? info_.free_ram_bytes - host_limit - os_reserve
+                : 0;
+        vram_limit = std::min(vram_limit, round_down(ram_room, cfg_.page_size));
+        if (vram_limit == 0) {
+            // No room for a meaningful device tier; the runtime degrades to
+            // host + NVMe and says so explicitly.
+            backend_reason_ += "; integrated GPU: no RAM headroom for a device tier, "
+                               "device tier disabled (host+NVMe)";
+        }
     }
 
     const uint64_t nvme_limit =
@@ -138,6 +164,7 @@ void Runtime::start() {
     vram_budget_.set_limit(vram_limit, cfg_.vram_reserve_margin);
     host_budget_.set_limit(host_limit, 0.0);
     host_.set_budget(host_limit, 0.0);
+    host_.set_device_backend(device_.get());  // pinned alloc via the device backend
     nvme_budget_.set_limit(nvme_limit, 0.0);
 
     planner_ = std::make_unique<Planner>(Planner::Budgets{});
@@ -145,13 +172,22 @@ void Runtime::start() {
 
     // NVMe store.
     std::string store_path = cfg_.nvme_path;
-    if (store_path.empty()) {
+    const bool auto_store_path = cfg_.nvme_path.empty();
+    if (auto_store_path) {
         std::error_code ec;
         store_path = (std::filesystem::temp_directory_path(ec) /
                       ("flashtier-store-" + std::to_string(process_id()) + ".bin"))
                          .string();
         if (ec) {
             throw Error(ErrorCode::Io, "cannot resolve temporary directory", ec.message());
+        }
+        // Auto-generated temp stores are ephemeral: a leftover from an
+        // interrupted run (or a failed deletion) with an incompatible
+        // geometry must not block this run. User-specified --nvme-path
+        // stores keep strict header validation below.
+        if (!cfg_.retain_store && std::filesystem::exists(store_path) &&
+            !store_header_valid(store_path, cfg_.page_size, nvme_limit + cfg_.page_size)) {
+            NvmeBackend::destroy_file(store_path);
         }
     }
     store_path_ = store_path;
@@ -172,7 +208,8 @@ void Runtime::start() {
 
     TelemetryEvent cfg_ev;
     cfg_ev.type = EventType::ConfigEvent;
-    cfg_ev.reason = cfg_.describe();
+    cfg_ev.reason = cfg_.describe() + "\n  selected backend: " + backend_name_ +
+                    "\n  selection reason: " + backend_reason_;
     emit_event(cfg_ev);
 
     // Workers.
@@ -203,12 +240,25 @@ void Runtime::shutdown() {
             NvmeBackend::destroy_file(store_path_);
         }
     }
-#if FLASHTIER_HAVE_CUDA
-    if (vram_) {
-        vram_->close();
-        vram_.reset();
+    // Release the device backend last: host buffers allocated through the
+    // backend's pinned allocator must be freed before the backend closes.
+    if (device_) {
+        if (device_stream_) {
+            device_->destroy_stream(device_stream_);
+            device_stream_ = nullptr;
+        }
+        if (device_event_a_) {
+            device_->destroy_event(device_event_a_);
+            device_event_a_ = nullptr;
+        }
+        if (device_event_b_) {
+            device_->destroy_event(device_event_b_);
+            device_event_b_ = nullptr;
+        }
+        device_->close();
+        device_.reset();
+        host_.set_device_backend(nullptr);
     }
-#endif
     if (sink_) {
         sink_->flush();
     }
@@ -253,8 +303,8 @@ PageId Runtime::allocate_page(uint64_t logical_bytes, SemanticClass cls,
 
     switch (tier) {
         case Tier::Vram: {
-#if FLASHTIER_HAVE_CUDA
-            // Planned eviction before allocation: never a blind cudaMalloc.
+            // Planned eviction before allocation: never a blind device
+            // allocation after budget exhaustion.
             ensure_vram_headroom(alloc_size);
             bool reserved = false;
             {
@@ -268,7 +318,7 @@ PageId Runtime::allocate_page(uint64_t logical_bytes, SemanticClass cls,
             }
             void* ptr = nullptr;
             try {
-                ptr = vram_->alloc(alloc_size);
+                ptr = device_alloc(alloc_size);
             } catch (...) {
                 vram_budget_.release(alloc_size);
                 throw;
@@ -279,10 +329,6 @@ PageId Runtime::allocate_page(uint64_t logical_bytes, SemanticClass cls,
                 table_.insert(meta);
                 table_.with(id, [&](PageMetadata& m) { m.transition(PageState::ResidentVram); });
             }
-#else
-            throw Error(ErrorCode::Unsupported,
-                        "VRAM allocation requested in a CPU-only build", id.to_string());
-#endif
             break;
         }
         case Tier::HostPinned:
@@ -352,9 +398,7 @@ void Runtime::free_page(PageId id) {
     {
         std::lock_guard lock(state_mu_);
         if (m.state == PageState::ResidentVram) {
-#if FLASHTIER_HAVE_CUDA
-            vram_->free(m.vram_ptr);
-#endif
+            device_free(m.vram_ptr);
             vram_budget_.release(m.allocation_size);
         } else if (m.state == PageState::ResidentHost) {
             host_.free(m.host_ptr, m.allocation_size);
@@ -405,17 +449,14 @@ void Runtime::write_page(PageId id, const void* data) {
                 std::memcpy(cur.host_ptr, data, bytes);
                 done = true;
             } else if (cur.state == PageState::ResidentVram) {
-#if FLASHTIER_HAVE_CUDA
                 std::vector<uint8_t> staging(bytes);
                 std::memcpy(staging.data(), data, bytes);
-                vram_->async_h2d(cur.vram_ptr, staging.data(), bytes, 0);
-                vram_->sync(0);
-#else
-                throw Error(ErrorCode::State,
-                            "page is VRAM-resident in a CPU-only build",
-                            id.to_string());
-#endif
+                device_copy_h2d(cur.vram_ptr, staging.data(), bytes);
                 done = true;
+            } else {
+                throw Error(ErrorCode::State,
+                            "page not writable in current state",
+                            id.to_string() + " " + page_state_name(cur.state));
             }
             if (done) {
                 table_.with(id, [&](PageMetadata& p) {
@@ -483,16 +524,9 @@ void Runtime::read_page(PageId id, void* out) {
                 std::memcpy(out, cur.host_ptr, bytes);
                 done = true;
             } else if (cur.state == PageState::ResidentVram) {
-#if FLASHTIER_HAVE_CUDA
                 std::vector<uint8_t> staging(bytes);
-                vram_->async_d2h(staging.data(), cur.vram_ptr, bytes, 1);
-                vram_->sync(1);
+                device_copy_d2h(staging.data(), cur.vram_ptr, bytes);
                 std::memcpy(out, staging.data(), bytes);
-#else
-                throw Error(ErrorCode::State,
-                            "page is VRAM-resident in a CPU-only build",
-                            id.to_string());
-#endif
                 done = true;
             }
             if (done) {
@@ -618,9 +652,7 @@ void Runtime::evict(PageId id) {
             const PageMetadata cur = table_.copy_of(id);
             if (!cur.dirty && cur.has_nvme_copy && !cur.in_flight &&
                 cur.state == PageState::ResidentVram) {
-#if FLASHTIER_HAVE_CUDA
-                vram_->free(cur.vram_ptr);
-#endif
+                device_free(cur.vram_ptr);
                 vram_budget_.release(cur.allocation_size);
                 table_.with(id, [&](PageMetadata& p) { p.transition(PageState::ResidentNvme); });
                 prefetched_pages_.erase(id.value);
@@ -720,16 +752,9 @@ void Runtime::verify_page(PageId id) {
                 std::memcpy(buf.data(), cur.host_ptr, buf.size());
                 done = true;
             } else if (cur.state == PageState::ResidentVram) {
-#if FLASHTIER_HAVE_CUDA
                 std::vector<uint8_t> staging(buf.size());
-                vram_->async_d2h(staging.data(), cur.vram_ptr, buf.size(), 1);
-                vram_->sync(1);
+                device_copy_d2h(staging.data(), cur.vram_ptr, buf.size());
                 std::memcpy(buf.data(), staging.data(), buf.size());
-#else
-                throw Error(ErrorCode::State,
-                            "page is VRAM-resident in a CPU-only build",
-                            id.to_string());
-#endif
                 done = true;
             }
             if (done) {
@@ -843,15 +868,10 @@ void Runtime::flush_telemetry() {
     if (sink_) sink_->flush();
 }
 
-void* Runtime::gpu_memory_handle(PageId id) {
-#if FLASHTIER_HAVE_CUDA
+void* Runtime::device_memory_handle(PageId id) {
     std::lock_guard lock(state_mu_);
     PageMetadata m = table_.copy_of(id);
     return m.state == PageState::ResidentVram ? m.vram_ptr : nullptr;
-#else
-    (void)id;
-    return nullptr;
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +981,10 @@ void Runtime::load_page(PageId id, Tier target) {
                         has_vram = vram_budget_.limit() != 0;
                     }
                     if (!has_vram) return;  // CPU-only: host is the top tier
+                    // Planned eviction before allocation: promoting into a
+                    // full device tier must free room first, never fail
+                    // with a raw device OOM or a spurious budget error.
+                    ensure_vram_headroom(m.allocation_size);
                     promote_host_to_vram(id);
                     {
                         std::lock_guard lock(state_mu_);
@@ -984,13 +1008,14 @@ void Runtime::load_page(PageId id, Tier target) {
                     continue;
                 }
                 if (target == Tier::Vram) {
-                    bool room = false;
+                    bool has_vram = false;
                     {
                         std::lock_guard lock(state_mu_);
-                        room = vram_budget_.limit() != 0 &&
-                               vram_budget_.headroom() >= m.allocation_size;
+                        has_vram = vram_budget_.limit() != 0;
                     }
-                    if (room) {
+                    if (has_vram) {
+                        // Planned eviction before promotion (see above).
+                        ensure_vram_headroom(m.allocation_size);
                         promote_host_to_vram(id);
                         {
                             std::lock_guard lock(state_mu_);
@@ -1113,9 +1138,7 @@ void Runtime::ensure_vram_headroom(uint64_t need_bytes) {
                 if (cur.pinned || cur.in_flight) continue;
                 if (d.target == Tier::Nvme && !cur.dirty && cur.has_nvme_copy &&
                     cur.state == PageState::ResidentVram) {
-#if FLASHTIER_HAVE_CUDA
-                    vram_->free(cur.vram_ptr);
-#endif
+                    device_free(cur.vram_ptr);
                     vram_budget_.release(cur.allocation_size);
                     table_.with(d.id, [&](PageMetadata& p) {
                         p.transition(PageState::ResidentNvme);
@@ -1192,12 +1215,7 @@ void Runtime::evict_vram_to_host(PageId id) {
     const uint64_t bytes = m.allocation_size;
     const std::string path = transfer_path_str(src, dst);
     try {
-#if FLASHTIER_HAVE_CUDA
-        vram_->async_d2h(host_ptr, m.vram_ptr, bytes, 0);
-        vram_->sync(0);
-#else
-        throw Error(ErrorCode::Unsupported, "CUDA backend unavailable");
-#endif
+        device_copy_d2h(host_ptr, m.vram_ptr, bytes);
     } catch (...) {
         std::lock_guard lock(state_mu_);
         host_.free(host_ptr, bytes);
@@ -1214,9 +1232,7 @@ void Runtime::evict_vram_to_host(PageId id) {
 
     {
         std::lock_guard lock(state_mu_);
-#if FLASHTIER_HAVE_CUDA
-        vram_->free(m.vram_ptr);
-#endif
+        device_free(m.vram_ptr);
         vram_budget_.release(bytes);
         table_.with(id, [&](PageMetadata& p) {
             p.vram_ptr = nullptr;
@@ -1372,18 +1388,20 @@ void Runtime::promote_host_to_vram(PageId id) {
         m = table_.copy_of(id);
         if (m.state != PageState::ResidentHost || m.in_flight) return;
     }
-#if !FLASHTIER_HAVE_CUDA
-    throw Error(ErrorCode::Unsupported, "CUDA backend unavailable");
-#else
+    if (!vram_tier_exists()) {
+        return;  // no device tier (CPU-only): host residency is the top tier
+    }
     void* vram_ptr = nullptr;
     {
         std::lock_guard lock(state_mu_);
         if (!vram_budget_.try_reserve(m.allocation_size)) {
-            throw Error(ErrorCode::Budget,
-                        "VRAM budget cannot be reserved for promotion", id.to_string());
+            // No headroom at reserve time (another worker consumed it).
+            // This is a no-op: load_page's retry loop re-runs
+            // ensure_vram_headroom and retries the promotion.
+            return;
         }
         try {
-            vram_ptr = vram_->alloc(m.allocation_size);
+            vram_ptr = device_alloc(m.allocation_size);
         } catch (...) {
             vram_budget_.release(m.allocation_size);
             throw;
@@ -1397,14 +1415,13 @@ void Runtime::promote_host_to_vram(PageId id) {
 
     const auto t0 = Clock::now();
     const uint64_t bytes = m.allocation_size;
-    const std::string path = "host_pinned->vram";
+    const std::string path = transfer_path_str(Tier::HostPinned, Tier::Vram);
     try {
-        vram_->async_h2d(vram_ptr, m.host_ptr, bytes, 0);
-        vram_->sync(0);
+        device_copy_h2d(vram_ptr, m.host_ptr, bytes);
     } catch (...) {
         std::lock_guard lock(state_mu_);
         vram_budget_.release(bytes);
-        vram_->free(vram_ptr);
+        device_free(vram_ptr);
         table_.with(id, [&](PageMetadata& p) {
             p.vram_ptr = nullptr;
             p.in_flight = false;
@@ -1429,7 +1446,6 @@ void Runtime::promote_host_to_vram(PageId id) {
     state_cv_.notify_all();
     record_transfer(EventType::TransferEnd, id, Tier::HostPinned, Tier::Vram, bytes, us,
                     "promote", path);
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1525,7 +1541,67 @@ PageMetadata Runtime::wait_settled(PageId id) {
 }
 
 std::string Runtime::transfer_path_str(Tier src, Tier dst) const {
-    return std::string(tier_name(src)) + "->" + tier_name(dst);
+    // The device tier is reported with the actual backend name so
+    // telemetry paths record the real transfer path, e.g.
+    // "cuda_device->host_pinned", "nvme->host_pinned->cuda_device".
+    auto tier_label = [this](Tier t) -> std::string {
+        if (t == Tier::Vram) {
+            return backend_name_.empty() ? std::string("vram")
+                                         : backend_name_ + "_device";
+        }
+        return tier_name(t);
+    };
+    return tier_label(src) + "->" + tier_label(dst);
+}
+
+bool Runtime::vram_tier_exists() const {
+    std::lock_guard lock(state_mu_);
+    return vram_budget_.limit() != 0 && device_ != nullptr;
+}
+
+void* Runtime::device_alloc(std::size_t bytes) {
+    if (device_ == nullptr) {
+        throw Error(ErrorCode::State,
+                    "device-memory allocation requested with no device backend");
+    }
+    return device_->allocate(bytes);
+}
+
+void Runtime::device_free(void* ptr) {
+    if (ptr == nullptr) return;
+    if (device_ == nullptr) {
+        throw Error(ErrorCode::State,
+                    "device-memory release requested with no device backend");
+    }
+    device_->free(ptr);
+}
+
+void Runtime::device_copy_h2d(void* dst, const void* src, std::size_t bytes) {
+    if (device_ == nullptr) {
+        throw Error(ErrorCode::State,
+                    "device transfer requested with no device backend");
+    }
+    device_->async_copy_host_to_device(dst, src, bytes, device_stream_);
+    device_->sync_stream(device_stream_);
+}
+
+void Runtime::device_copy_d2h(void* dst, const void* src, std::size_t bytes) {
+    if (device_ == nullptr) {
+        throw Error(ErrorCode::State,
+                    "device transfer requested with no device backend");
+    }
+    device_->async_copy_device_to_host(dst, src, bytes, device_stream_);
+    device_->sync_stream(device_stream_);
+}
+
+void Runtime::device_sync() {
+    if (device_ != nullptr) {
+        device_->sync_all();
+    }
+}
+
+std::string Runtime::selected_backend() const {
+    return backend_name_.empty() ? "auto" : backend_name_;
 }
 
 }  // namespace flashtier

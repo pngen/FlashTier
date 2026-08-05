@@ -42,8 +42,11 @@ FT_TEST(illegal_transitions_are_rejected) {
     FT_ASSERT_THROWS(p.transition(PageState::EvictingToHost), ErrorCode::State);  // from Unallocated
     p.transition(PageState::ResidentVram);
     FT_ASSERT_THROWS(p.transition(PageState::ResidentVram), ErrorCode::State);    // no-op not allowed
-    FT_ASSERT_THROWS(p.transition(PageState::ResidentNvme), ErrorCode::State);    // no direct hop
     FT_ASSERT_THROWS(p.transition(PageState::LoadingToVram), ErrorCode::State);
+    // ResidentVram -> ResidentNvme is the legal clean drop (valid NVMe copy,
+    // no transfer); the next transition from ResidentNvme must be a load.
+    p.transition(PageState::ResidentNvme);
+    FT_ASSERT_THROWS(p.transition(PageState::ResidentVram), ErrorCode::State);    // no direct hop
     p.transition(PageState::Released);
     FT_ASSERT_THROWS(p.transition(PageState::Unallocated), ErrorCode::State);     // terminal
     FT_ASSERT_THROWS(p.transition(PageState::Released), ErrorCode::State);
@@ -57,6 +60,8 @@ FT_TEST(transition_table_is_symmetric_with_spec) {
     FT_ASSERT(transition_allowed(PageState::LoadingToVram, PageState::ResidentVram));
     FT_ASSERT(transition_allowed(PageState::ResidentVram, PageState::EvictingToHost));
     FT_ASSERT(transition_allowed(PageState::EvictingToHost, PageState::ResidentHost));
+    FT_ASSERT(transition_allowed(PageState::ResidentVram, PageState::ResidentNvme));  // clean drop
+    FT_ASSERT(!transition_allowed(PageState::ResidentVram, PageState::ResidentHost));
     FT_ASSERT(transition_allowed(PageState::ResidentHost, PageState::EvictingToNvme));
     FT_ASSERT(transition_allowed(PageState::EvictingToNvme, PageState::ResidentNvme));
     FT_ASSERT(transition_allowed(PageState::ResidentNvme, PageState::LoadingToHost));
@@ -64,7 +69,7 @@ FT_TEST(transition_table_is_symmetric_with_spec) {
     FT_ASSERT(transition_allowed(PageState::ResidentHost, PageState::LoadingToVram));
     FT_ASSERT(transition_allowed(PageState::LoadingToVram, PageState::Error));
     FT_ASSERT(transition_allowed(PageState::Error, PageState::Released));
-    FT_ASSERT(!transition_allowed(PageState::ResidentVram, PageState::ResidentNvme));
+    FT_ASSERT(!transition_allowed(PageState::ResidentVram, PageState::ResidentHost));
     FT_ASSERT(!transition_allowed(PageState::ResidentNvme, PageState::ResidentVram));
     FT_ASSERT(!transition_allowed(PageState::Released, PageState::ResidentHost));
 }

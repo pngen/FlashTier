@@ -13,6 +13,11 @@ include(FlashTierWarnings)
 # Options
 # ---------------------------------------------------------------------------
 option(FLASHTIER_ENABLE_CUDA           "Build with NVIDIA CUDA support" ON)
+option(FLASHTIER_ENABLE_HIP            "Build with AMD HIP/ROCm support (requires HIP toolchain)" OFF)
+option(FLASHTIER_ENABLE_LEVEL_ZERO     "Build with Intel Level Zero support (runtime loader probe)" ON)
+option(FLASHTIER_ENABLE_VULKAN         "Build with experimental Vulkan backend (runtime loader probe)" ON)
+option(FLASHTIER_ENABLE_METAL          "Build with Apple Metal backend (macOS only)" ON)
+option(FLASHTIER_ENABLE_CPU_BACKEND    "Build the CPU emulation backend" ON)
 option(FLASHTIER_ENABLE_DIRECTSTORAGE  "Probe Windows DirectStorage (experimental capability probe only; never required)" OFF)
 option(FLASHTIER_ENABLE_GDS            "Enable GPUDirect Storage backend where available (Linux-first; never required)" OFF)
 option(FLASHTIER_BUILD_TESTS           "Build unit tests" ON)
@@ -41,11 +46,21 @@ set(FLASHTIER_GIT_REVISION "${FLASHTIER_GIT_REVISION}" CACHE STRING "Git revisio
 # ---------------------------------------------------------------------------
 # Compiler setup
 # ---------------------------------------------------------------------------
+# FlashTier is C++20 throughout; the standard is a project property, not a
+# preset-only setting.
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+if(FLASHTIER_ENABLE_CUDA)
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
+
 if(MSVC)
-  add_compile_options(/W4 /permissive- /Zc:__cplusplus)
+  # Compiler warning flags are applied per-target by
+  # flashtier_apply_warnings(), scoped to CXX so nvcc never receives bare
+  # MSVC options. Defines are language-neutral.
   add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
-else()
-  add_compile_options(-Wall -Wextra)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -65,12 +80,32 @@ if(FLASHTIER_ENABLE_CUDA)
   message(STATUS "FlashTier: CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
+# ---------------------------------------------------------------------------
+# HIP / ROCm (AMD)
+# ---------------------------------------------------------------------------
+set(FLASHTIER_HAVE_HIP OFF)
+if(FLASHTIER_ENABLE_HIP)
+  find_package(HIP REQUIRED)
+  set(FLASHTIER_HAVE_HIP ON)
+  message(STATUS "FlashTier: HIP toolchain ${HIP_VERSION}")
+endif()
+
+# Level Zero / Vulkan use runtime loader probes (no SDK required).
+set(FLASHTIER_HAVE_LEVEL_ZERO ${FLASHTIER_ENABLE_LEVEL_ZERO})
+set(FLASHTIER_HAVE_VULKAN ${FLASHTIER_ENABLE_VULKAN})
+if(APPLE)
+  set(FLASHTIER_HAVE_METAL ${FLASHTIER_ENABLE_METAL})
+else()
+  set(FLASHTIER_HAVE_METAL OFF)
+endif()
+set(FLASHTIER_HAVE_CPU_BACKEND ${FLASHTIER_ENABLE_CPU_BACKEND})
+
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
-# Core library (C++, compiles without CUDA)
+# Core library (C++, compiles without any accelerator SDK)
 # ---------------------------------------------------------------------------
-add_library(flashtier_core STATIC
+set(FLASHTIER_CORE_SOURCES
   src/error.cpp
   src/config.cpp
   src/cli.cpp
@@ -85,10 +120,29 @@ add_library(flashtier_core STATIC
   src/telemetry.cpp
   src/integrity.cpp
   src/workload.cpp
+  src/backends/backend_registry.cpp
   src/backends/storage_backend.cpp
   src/backends/host_backend.cpp
   src/backends/nvme_backend.cpp
   src/runtime.cpp)
+
+if(FLASHTIER_HAVE_CPU_BACKEND)
+  list(APPEND FLASHTIER_CORE_SOURCES src/backends/cpu_backend.cpp)
+endif()
+if(FLASHTIER_HAVE_LEVEL_ZERO)
+  list(APPEND FLASHTIER_CORE_SOURCES src/backends/level_zero_backend.cpp)
+endif()
+if(FLASHTIER_HAVE_VULKAN)
+  list(APPEND FLASHTIER_CORE_SOURCES src/backends/vulkan_backend.cpp)
+endif()
+if(FLASHTIER_HAVE_METAL)
+  list(APPEND FLASHTIER_CORE_SOURCES src/backends/metal_backend.cpp)
+endif()
+if(FLASHTIER_HAVE_HIP)
+  list(APPEND FLASHTIER_CORE_SOURCES src/backends/hip_backend.cpp)
+endif()
+
+add_library(flashtier_core STATIC ${FLASHTIER_CORE_SOURCES})
 
 target_include_directories(flashtier_core PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
@@ -100,12 +154,21 @@ target_compile_definitions(flashtier_core PRIVATE
   FLASHTIER_ENABLE_DIRECTSTORAGE=$<BOOL:${FLASHTIER_ENABLE_DIRECTSTORAGE}>
   FLASHTIER_ENABLE_GDS=$<BOOL:${FLASHTIER_ENABLE_GDS}>)
 
+target_compile_definitions(flashtier_core PUBLIC
+  FLASHTIER_HAVE_CUDA=$<BOOL:${FLASHTIER_HAVE_CUDA}>
+  FLASHTIER_HAVE_HIP=$<BOOL:${FLASHTIER_HAVE_HIP}>
+  FLASHTIER_HAVE_LEVEL_ZERO=$<BOOL:${FLASHTIER_HAVE_LEVEL_ZERO}>
+  FLASHTIER_HAVE_VULKAN=$<BOOL:${FLASHTIER_HAVE_VULKAN}>
+  FLASHTIER_HAVE_METAL=$<BOOL:${FLASHTIER_HAVE_METAL}>
+  FLASHTIER_HAVE_CPU_BACKEND=$<BOOL:${FLASHTIER_HAVE_CPU_BACKEND}>)
+
 if(FLASHTIER_HAVE_CUDA)
-  target_compile_definitions(flashtier_core PUBLIC FLASHTIER_HAVE_CUDA=1)
   target_include_directories(flashtier_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(flashtier_core PUBLIC CUDA::cudart)
-else()
-  target_compile_definitions(flashtier_core PUBLIC FLASHTIER_HAVE_CUDA=0)
+endif()
+if(FLASHTIER_HAVE_HIP)
+  target_include_directories(flashtier_core PUBLIC ${HIP_INCLUDE_DIRS})
+  target_link_libraries(flashtier_core PUBLIC hip::host)
 endif()
 
 target_link_libraries(flashtier_core PUBLIC Threads::Threads)
@@ -119,17 +182,23 @@ if(FLASHTIER_WARNINGS_AS_ERRORS)
 endif()
 
 # ---------------------------------------------------------------------------
-# CUDA-only library (device integration)
+# CUDA-only library (vendor backend implementation)
 # ---------------------------------------------------------------------------
 if(FLASHTIER_HAVE_CUDA)
   add_library(flashtier_cuda STATIC
-    src/backends/vram_backend.cu
+    src/backends/cuda_backend.cu
     src/backends/unified_memory.cu)
   target_include_directories(flashtier_cuda PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
     "$<INSTALL_INTERFACE:include>")
   target_compile_definitions(flashtier_cuda PRIVATE FLASHTIER_HAVE_CUDA=1)
-  target_compile_options(flashtier_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W4>)
+  if(MSVC)
+    target_compile_options(flashtier_cuda PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W4,-permissive-,/Zc:__cplusplus>)
+  else()
+    target_compile_options(flashtier_cuda PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+  endif()
   if(FLASHTIER_WARNINGS_AS_ERRORS)
     if(MSVC)
       target_compile_options(flashtier_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/WX>)

@@ -116,7 +116,8 @@ std::string bytesize_to_string(uint64_t bytes) {
     return buf;
 }
 
-ConfigValidation validate_config(const Config& cfg) noexcept {
+ConfigValidation validate_config(const Config& cfg,
+                                 const std::vector<std::string>& known_backends) noexcept {
     ConfigValidation out;
     out.ok = true;
 
@@ -124,6 +125,19 @@ ConfigValidation validate_config(const Config& cfg) noexcept {
         out.ok = false;
         out.errors.push_back(msg);
     };
+
+    if (!cfg.backend.empty() && cfg.backend != "auto") {
+        bool found = false;
+        for (const auto& b : known_backends) {
+            if (b == cfg.backend) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            fail("unknown device backend '" + cfg.backend + "'");
+        }
+    }
 
     if (cfg.page_size == 0) {
         fail("page size must be nonzero");
@@ -145,7 +159,8 @@ ConfigValidation validate_config(const Config& cfg) noexcept {
 }
 
 std::string Config::describe() const {
-    return "  device: " + std::to_string(device_id) + "\n" +
+    return "  backend: " + (backend.empty() ? std::string("auto") : backend) + "\n" +
+           "  device: " + std::to_string(device_id) + "\n" +
            "  page size: " + bytesize_to_string(page_size) + "\n" +
            "  working set: " + (working_set_bytes ? bytesize_to_string(working_set_bytes) : std::string("auto")) + "\n" +
            "  vram budget: " + bytesize_to_string(vram_budget_bytes) + "\n" +

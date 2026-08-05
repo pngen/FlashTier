@@ -17,6 +17,7 @@ const char* error_code_name(ErrorCode code) noexcept {
         case ErrorCode::Unsupported: return "unsupported";
         case ErrorCode::Cancelled: return "cancelled";
         case ErrorCode::Integrity: return "integrity";
+        case ErrorCode::Device: return "device";
         case ErrorCode::Internal: return "internal";
     }
     return "unknown";
