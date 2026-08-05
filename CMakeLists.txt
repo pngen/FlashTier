@@ -7,6 +7,7 @@ project(FlashTier
   LANGUAGES CXX)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(FlashTierWarnings)
 
 # ---------------------------------------------------------------------------
 # Options
@@ -70,9 +71,14 @@ find_package(Threads REQUIRED)
 # Core library (C++, compiles without CUDA)
 # ---------------------------------------------------------------------------
 add_library(flashtier_core STATIC
+  src/error.cpp
   src/config.cpp
+  src/cli.cpp
   src/device_info.cpp
   src/page.cpp
+  src/page_id.cpp
+  src/page_table.cpp
+  src/tier.cpp
   src/allocator.cpp
   src/planner.cpp
   src/policy.cpp
@@ -90,7 +96,9 @@ target_include_directories(flashtier_core PUBLIC
 
 target_compile_definitions(flashtier_core PRIVATE
   FLASHTIER_VERSION="${PROJECT_VERSION}"
-  FLASHTIER_GIT_REVISION="${FLASHTIER_GIT_REVISION}")
+  FLASHTIER_GIT_REVISION="${FLASHTIER_GIT_REVISION}"
+  FLASHTIER_ENABLE_DIRECTSTORAGE=$<BOOL:${FLASHTIER_ENABLE_DIRECTSTORAGE}>
+  FLASHTIER_ENABLE_GDS=$<BOOL:${FLASHTIER_ENABLE_GDS}>)
 
 if(FLASHTIER_HAVE_CUDA)
   target_compile_definitions(flashtier_core PUBLIC FLASHTIER_HAVE_CUDA=1)
@@ -136,9 +144,17 @@ endif()
 # CLI
 # ---------------------------------------------------------------------------
 add_executable(flashtier src/cli/main.cpp)
+target_compile_definitions(flashtier PRIVATE
+  FLASHTIER_VERSION="${PROJECT_VERSION}"
+  FLASHTIER_GIT_REVISION="${FLASHTIER_GIT_REVISION}")
 target_link_libraries(flashtier PRIVATE flashtier_core)
 if(FLASHTIER_HAVE_CUDA)
   target_link_libraries(flashtier PRIVATE flashtier_cuda)
+endif()
+if(FLASHTIER_BUILD_BENCHMARKS)
+  target_link_libraries(flashtier PRIVATE flashtier_benchlib)
+else()
+  target_sources(flashtier PRIVATE src/benchmark_stub.cpp)
 endif()
 
 if(FLASHTIER_WARNINGS_AS_ERRORS)

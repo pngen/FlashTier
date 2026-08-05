@@ -1,0 +1,121 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/pngen/FlashTier/blob/main/schemas/telemetry.schema.json",
+  "title": "FlashTier telemetry event",
+  "description": "Schema for FlashTier JSON Lines telemetry (version 1.0). Each line of a .jsonl telemetry file is one event object conforming to this schema. All telemetry is local; FlashTier never transmits telemetry.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Schema version of this event."
+    },
+    "timestamp_us": {
+      "type": "integer",
+      "description": "Wall-clock time in microseconds since the Unix epoch."
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic per-sink sequence number."
+    },
+    "event": {
+      "type": "string",
+      "enum": [
+        "page_alloc", "page_free", "page_write", "page_read",
+        "transfer_begin", "transfer_end", "evict", "prefetch_issue",
+        "prefetch_hit", "prefetch_waste", "demand_fault", "stall",
+        "integrity_check", "error", "benchmark_begin", "benchmark_end",
+        "store_op", "config"
+      ]
+    },
+    "page_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Stable page/region ID; 0 when not applicable."
+    },
+    "src_tier": { "$ref": "#/definitions/tier" },
+    "dst_tier": { "$ref": "#/definitions/tier" },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Bytes moved or allocated."
+    },
+    "duration_us": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Transfer duration in microseconds."
+    },
+    "bandwidth_gb_s": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Effective bandwidth in GB/s for this transfer."
+    },
+    "policy": {
+      "type": "string",
+      "enum": ["lru", "predictive", ""]
+    },
+    "reason": { "type": "string" },
+    "path": {
+      "type": "string",
+      "description": "Transfer path, e.g. nvme->host_pinned."
+    },
+    "queue_depth": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Transfer queue depth at event time."
+    },
+    "vram_used": { "type": "integer", "minimum": 0 },
+    "vram_free": { "type": "integer", "minimum": 0 },
+    "host_used": { "type": "integer", "minimum": 0 },
+    "host_free": { "type": "integer", "minimum": 0 },
+    "nvme_used": { "type": "integer", "minimum": 0 },
+    "nvme_free": { "type": "integer", "minimum": 0 },
+    "cache_hit": {
+      "type": "boolean",
+      "description": "Access served from VRAM (cache hit)."
+    },
+    "prefetch_hit": {
+      "type": "boolean",
+      "description": "Prefetched page subsequently accessed."
+    },
+    "prefetch_waste": {
+      "type": "boolean",
+      "description": "Prefetched page evicted or never accessed."
+    },
+    "stall_us": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Time a demand access waited for transfers."
+    },
+    "checksum_ok": {
+      "type": "boolean",
+      "description": "Integrity check result."
+    },
+    "checksum_expected": { "type": "string" },
+    "checksum_actual": { "type": "string" },
+    "cuda_error": { "type": "string" },
+    "error_code": { "type": "string" },
+    "logical_size": {
+      "type": "integer",
+      "description": "Logical byte size of an allocation."
+    },
+    "op": {
+      "type": "string",
+      "description": "Store operation name (store_op events)."
+    },
+    "throughput": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Workload throughput in ops/s (benchmark events)."
+    }
+  },
+  "required": ["schema", "sequence", "event"],
+  "additionalProperties": false,
+  "definitions": {
+    "tier": {
+      "type": "string",
+      "enum": ["none", "vram", "host_pinned", "nvme", "host_pageable"]
+    }
+  }
+}

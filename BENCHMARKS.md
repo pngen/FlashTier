@@ -59,6 +59,24 @@ Every benchmark is a deterministic, seeded run:
   the resulting working set must fit host + NVMe budgets.
 - Defaults never allocate dangerous proportions of RAM or disk.
 
+### Bounded local-validation defaults
+
+Benchmark defaults are intentionally small so a local validation run
+finishes within a minute on ordinary hardware. Multi-gigabyte hardware runs
+require explicit sizes.
+
+| Benchmark | Default size |
+|---|---|
+| `tiers` | 64 MiB buffer |
+| `oversubscription` | VRAM budget ≤ 1 GiB, host budget ≤ 512 MiB, NVMe ≤ 8 GiB; working sets 1.0×–2.0× of the budget; CPU-only: 128 MiB host budget |
+| `prefetch` | working set ≤ 256 MiB (2× of a ≤512 MiB hot tier) |
+| `sparse-experts` | ≤ 128 experts, ≤ 2048 tokens |
+| `unified-memory` | working set ≤ 2 GiB (2× of a ≤1 GiB VRAM budget) |
+
+Explicit `--working-set`, `--vram-budget`, `--host-budget`, and
+`--nvme-budget` values bypass these caps but are always validated against
+detected free capacity before any allocation.
+
 ## 5. Reproducibility
 
 A report must include the "configuration block" printed at the top of the

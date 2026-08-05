@@ -38,7 +38,9 @@ flashtier-store-*.bin
 
 # ---- Generated telemetry / data --------------------------------------------
 telemetry*.jsonl
-*.telemetry.jsonl
+telemetry*.human.txt
+flashtier-telemetry-*.jsonl
+flashtier-telemetry-*.human.txt
 benchmark-results/
 results/
 
@@ -46,6 +48,7 @@ results/
 *.tmp
 *.bak
 *~
+*.obj
 
 # ---- IDE state --------------------------------------------------------------
 .idea/
