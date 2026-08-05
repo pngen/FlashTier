@@ -1,0 +1,131 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-cuda-debug",
+      "displayName": "Windows CUDA Debug",
+      "description": "Debug build with CUDA on Windows (Visual Studio 2022)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/windows-cuda-debug",
+      "cacheVariables": {
+        "FLASHTIER_ENABLE_CUDA": "ON",
+        "FLASHTIER_BUILD_TESTS": "ON",
+        "FLASHTIER_BUILD_BENCHMARKS": "ON",
+        "FLASHTIER_BUILD_EXAMPLES": "ON",
+        "CMAKE_CONFIGURATION_TYPES": "Debug;Release",
+        "CMAKE_CXX_STANDARD": "20"
+      }
+    },
+    {
+      "name": "windows-cuda-release",
+      "displayName": "Windows CUDA Release",
+      "description": "Release build with CUDA on Windows (Visual Studio 2022)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/windows-cuda-release",
+      "cacheVariables": {
+        "FLASHTIER_ENABLE_CUDA": "ON",
+        "FLASHTIER_BUILD_TESTS": "ON",
+        "FLASHTIER_BUILD_BENCHMARKS": "ON",
+        "FLASHTIER_BUILD_EXAMPLES": "ON",
+        "FLASHTIER_WARNINGS_AS_ERRORS": "ON",
+        "CMAKE_CONFIGURATION_TYPES": "Release",
+        "CMAKE_CXX_STANDARD": "20"
+      }
+    },
+    {
+      "name": "windows-cpu-release",
+      "displayName": "Windows CPU-only Release",
+      "description": "Release build without CUDA on Windows (Visual Studio 2022)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/windows-cpu-release",
+      "cacheVariables": {
+        "FLASHTIER_ENABLE_CUDA": "OFF",
+        "FLASHTIER_BUILD_TESTS": "ON",
+        "FLASHTIER_BUILD_BENCHMARKS": "ON",
+        "FLASHTIER_BUILD_EXAMPLES": "ON",
+        "FLASHTIER_WARNINGS_AS_ERRORS": "ON",
+        "CMAKE_CONFIGURATION_TYPES": "Release",
+        "CMAKE_CXX_STANDARD": "20"
+      }
+    },
+    {
+      "name": "linux-cuda-release",
+      "displayName": "Linux CUDA Release",
+      "description": "Release build with CUDA on Linux (Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-cuda-release",
+      "cacheVariables": {
+        "FLASHTIER_ENABLE_CUDA": "ON",
+        "FLASHTIER_BUILD_TESTS": "ON",
+        "FLASHTIER_BUILD_BENCHMARKS": "ON",
+        "FLASHTIER_BUILD_EXAMPLES": "ON",
+        "FLASHTIER_WARNINGS_AS_ERRORS": "ON",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_STANDARD": "20"
+      }
+    },
+    {
+      "name": "linux-cpu-release",
+      "displayName": "Linux CPU-only Release",
+      "description": "Release build without CUDA on Linux (Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-cpu-release",
+      "cacheVariables": {
+        "FLASHTIER_ENABLE_CUDA": "OFF",
+        "FLASHTIER_BUILD_TESTS": "ON",
+        "FLASHTIER_BUILD_BENCHMARKS": "ON",
+        "FLASHTIER_BUILD_EXAMPLES": "ON",
+        "FLASHTIER_WARNINGS_AS_ERRORS": "ON",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_STANDARD": "20"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-cuda-debug",    "configurePreset": "windows-cuda-debug" },
+    { "name": "windows-cuda-release",  "configurePreset": "windows-cuda-release" },
+    { "name": "windows-cpu-release",   "configurePreset": "windows-cpu-release" },
+    { "name": "linux-cuda-release",    "configurePreset": "linux-cuda-release" },
+    { "name": "linux-cpu-release",     "configurePreset": "linux-cpu-release" }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-cuda-debug",
+      "configurePreset": "windows-cuda-debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "windows-cuda-release",
+      "configurePreset": "windows-cuda-release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "windows-cpu-release",
+      "configurePreset": "windows-cpu-release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "linux-cuda-release",
+      "configurePreset": "linux-cuda-release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "linux-cpu-release",
+      "configurePreset": "linux-cpu-release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    }
+  ]
+}

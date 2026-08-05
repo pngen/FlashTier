@@ -1,0 +1,72 @@
+# ---- Build outputs ---------------------------------------------------------
+build/
+build-*/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+
+# ---- Visual Studio output --------------------------------------------------
+.vs/
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+Win32/
+x64/
+Debug/
+Release/
+RelWithDebInfo/
+
+# ---- CUDA intermediates ----------------------------------------------------
+*.cudafe1.cpp
+*.cudafe1.hpp
+*.cudafe2.cpp
+*.cudafe2.hpp
+*.fatbin.c
+*.fatbin
+*.cubin
+*.ptx
+*.cu.cpp
+*.cu.obj
+*.gpu
+tmpxft_*
+
+# ---- Benchmark backing stores ----------------------------------------------
+flashtier-store-*.bin
+*.ftstore
+.flashtier-*
+
+# ---- Generated telemetry / data --------------------------------------------
+telemetry*.jsonl
+*.telemetry.jsonl
+benchmark-results/
+results/
+
+# ---- Temporary data ---------------------------------------------------------
+*.tmp
+*.bak
+*~
+
+# ---- IDE state --------------------------------------------------------------
+.idea/
+.vscode/
+*.code-workspace
+
+# ---- Logs / crash dumps -----------------------------------------------------
+*.log
+*.dmp
+core
+core.*
+minidumps/
+
+# ---- Local environment files -----------------------------------------------
+.env
+.env.*
+local-*/
+
+# ---- Package artifacts ------------------------------------------------------
+*.zip
+*.tar.gz
+*.7z
+*.nuget
+*.nupkg
