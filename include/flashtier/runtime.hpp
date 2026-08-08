@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -37,13 +38,14 @@ namespace flashtier {
 //  - one state lock guards the page table, budgets, and queues;
 //  - a bounded worker pool (queue_depth threads) executes page-level
 //    transfer chains; chains never wait on other chains;
-//  - device copies are async on a backend stream with events;
+//  - device copies use a backend transfer stream and synchronize each copy;
 //  - NVMe ops are async (IOCP / threaded);
-//  - deterministic shutdown: stop flag, drain, join, close backends.
+//  - deterministic shutdown: reject/cancel queued work, join, release pages,
+//    then close backends.
 class Runtime {
 public:
     explicit Runtime(const Config& cfg);
-    ~Runtime();
+    ~Runtime() noexcept;
 
     Runtime(const Runtime&) = delete;
     Runtime& operator=(const Runtime&) = delete;
@@ -85,14 +87,16 @@ public:
     // ---- introspection -----------------------------------------------------
     PageMetadata metadata(PageId id) const;
     const Config& config() const noexcept { return cfg_; }
-    SystemInfo system_info() const noexcept { return info_; }
+    SystemInfo system_info() const;
     TelemetryAggregates aggregates() const;
     uint64_t access_sequence() const noexcept { return access_seq_.load(); }
 
     // Selected device backend (null when the runtime runs host+NVMe only).
-    DeviceBackend* device_backend() const { return device_.get(); }
+    // Borrowed pointer, valid only while the caller prevents concurrent
+    // shutdown of this Runtime.
+    DeviceBackend* device_backend() const;
     std::string selected_backend() const;
-    std::string backend_selection_reason() const { return backend_reason_; }
+    std::string backend_selection_reason() const;
 
     uint64_t vram_used() const;
     uint64_t host_used() const;
@@ -114,11 +118,16 @@ private:
     // ---- transfer chain steps (worker-executed) ---------------------------
     void ensure_vram_headroom(uint64_t need_bytes);
     void* claim_host_buffer(uint64_t bytes, PageId for_page);
+    // Requires state_mu_. Reclaims NVMe extents duplicated by an authoritative
+    // resident host/device copy, including stale copies invalidated by writes.
+    bool reserve_nvme_range_locked(uint64_t extent_count, uint64_t bytes,
+                                   uint64_t& offset, PageId exclude);
     void evict_vram_to_host(PageId id);
     void evict_host_to_nvme(PageId id);
     void load_nvme_to_host(PageId id);
     void promote_host_to_vram(PageId id);
     void load_page(PageId id, Tier target);  // demand or prefetch entry
+    void write_page_impl(PageId id, const void* data);
 
     // ---- helpers -----------------------------------------------------------
     void emit_event(TelemetryEvent ev);
@@ -133,33 +142,41 @@ private:
     void worker_loop();
     void submit_demand(PageId id, Tier target);
     void submit_prefetch(PageId id, Tier target);
+    void require_running() const;
+    bool stop_requested() const;
+    void shutdown_locked();
+    void demote_to_host_impl(PageId id);
     std::string transfer_path_str(Tier src, Tier dst) const;
     bool vram_tier_exists() const;
     void* device_alloc(std::size_t bytes);
     void device_free(void* ptr);
     void device_copy_h2d(void* dst, const void* src, std::size_t bytes);
     void device_copy_d2h(void* dst, const void* src, std::size_t bytes);
-    void device_sync();
 
     // ---- members -----------------------------------------------------------
     Config cfg_;
     SystemInfo info_;
     PageTable table_;
+    // start()/shutdown() serialize through lifecycle_control_mu_. Public
+    // operations hold lifecycle_mu_ shared so teardown cannot release their
+    // resources while they are active.
+    std::mutex lifecycle_control_mu_;
+    mutable std::shared_mutex lifecycle_mu_;
     mutable std::mutex state_mu_;
     std::condition_variable state_cv_;
     std::mutex headroom_mu_;  // serializes host-buffer claims + evictions
+    std::mutex device_io_mu_; // serializes operations on the shared stream
 
+    // Declared before host_ so host allocations are destroyed first if an
+    // exceptional teardown leaves backend-owned pinned memory live.
+    std::unique_ptr<DeviceBackend> device_;  // vendor-neutral accelerator
     TierBudget vram_budget_;
-    TierBudget host_budget_;
     TierBudget nvme_budget_;
     HostBackend host_;
     std::unique_ptr<Planner> planner_;
     std::unique_ptr<Policy> policy_;
 
-    std::unique_ptr<DeviceBackend> device_;  // vendor-neutral accelerator
     DeviceStream* device_stream_ = nullptr;  // runtime transfer stream
-    DeviceEvent* device_event_a_ = nullptr;  // timing events
-    DeviceEvent* device_event_b_ = nullptr;
     std::string backend_name_;
     std::string backend_reason_;
 
@@ -174,22 +191,25 @@ private:
         PageId page;
         Tier target = Tier::Vram;
         std::shared_ptr<void> completion;  // shared_ptr<promise<void>> marker
-        std::string reason;
     };
     std::deque<Request> queue_;
-    std::mutex queue_mu_;
+    // Guarded by queue_mu_; covers both queued and currently executing
+    // prefetches so duplicate submission cannot race a worker pop.
+    std::unordered_set<uint64_t> pending_prefetches_;
+    mutable std::mutex queue_mu_;
     std::condition_variable queue_cv_;
     std::vector<std::thread> workers_;
-    bool stopping_ = false;
+    bool running_ = false;
+    bool stopping_ = true;
 
     std::atomic<uint64_t> access_seq_{0};
     std::atomic<uint64_t> next_page_id_{1};
     std::unordered_set<uint64_t> prefetched_pages_;
-    std::unordered_map<uint64_t, std::weak_ptr<void>> in_flight_ops_;
+    uint64_t instance_id_ = 0;
+    uint64_t start_generation_ = 0;
 
     std::shared_ptr<TelemetrySink> sink_;
     std::unique_ptr<TelemetryAggregator> agg_;
-    uint64_t last_seq_ = 0;
 };
 
 }  // namespace flashtier

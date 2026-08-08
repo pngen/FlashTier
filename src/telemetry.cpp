@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <memory>
 #include <sstream>
 
 #include "flashtier/error.hpp"
@@ -79,7 +80,12 @@ void append_u64(std::string& out, const char* key, uint64_t val, bool& first) {
 
 void append_i64(std::string& out, const char* key, int64_t val, bool& first) {
     if (val == 0) return;
-    append_u64(out, key, static_cast<uint64_t>(val), first);
+    if (!first) out += ",";
+    first = false;
+    out += "\"";
+    out += key;
+    out += "\":";
+    out += std::to_string(val);
 }
 
 void append_dbl(std::string& out, const char* key, double val, bool& first) {
@@ -193,26 +199,29 @@ TelemetrySink::TelemetrySink(std::string human_path, std::string jsonl_path, boo
     : human_path_(std::move(human_path)),
       jsonl_path_(std::move(jsonl_path)),
       to_stdout_(to_stdout) {
+    std::unique_ptr<std::ofstream> human;
+    std::unique_ptr<std::ofstream> jsonl;
     if (!human_path_.empty()) {
-        auto* s = new std::ofstream(human_path_);
-        if (!s->is_open()) {
-            delete s;
+        human = std::make_unique<std::ofstream>(human_path_);
+        if (!human->is_open()) {
             throw Error(ErrorCode::Io, "cannot open human telemetry file", human_path_);
         }
-        human_stream_ = s;
     }
     if (!jsonl_path_.empty()) {
-        auto* s = new std::ofstream(jsonl_path_);
-        if (!s->is_open()) {
-            delete s;
+        jsonl = std::make_unique<std::ofstream>(jsonl_path_);
+        if (!jsonl->is_open()) {
             throw Error(ErrorCode::Io, "cannot open JSONL telemetry file", jsonl_path_);
         }
-        jsonl_stream_ = s;
     }
+    human_stream_ = human.release();
+    jsonl_stream_ = jsonl.release();
 }
 
-TelemetrySink::~TelemetrySink() {
-    flush();
+TelemetrySink::~TelemetrySink() noexcept {
+    try {
+        flush();
+    } catch (...) {
+    }
     if (human_stream_) delete static_cast<std::ofstream*>(human_stream_);
     if (jsonl_stream_) delete static_cast<std::ofstream*>(jsonl_stream_);
 }
@@ -225,25 +234,56 @@ uint64_t TelemetrySink::emit_sequenced(TelemetryEvent ev) {
     std::lock_guard lock(mu_);
     ev.sequence = ++sequence_;
     ev.timestamp_us = wall_clock_us();
-    ++emitted_;
     if (human_stream_) {
-        *static_cast<std::ofstream*>(human_stream_) << human_line(ev) << '\n';
+        auto& stream = *static_cast<std::ofstream*>(human_stream_);
+        stream << human_line(ev) << '\n';
+        if (!stream) {
+            throw Error(ErrorCode::Io, "failed to write human telemetry",
+                        human_path_);
+        }
     }
     if (jsonl_stream_) {
-        *static_cast<std::ofstream*>(jsonl_stream_) << telemetry_event_to_jsonl(ev) << '\n';
+        auto& stream = *static_cast<std::ofstream*>(jsonl_stream_);
+        stream << telemetry_event_to_jsonl(ev) << '\n';
+        if (!stream) {
+            throw Error(ErrorCode::Io, "failed to write JSONL telemetry",
+                        jsonl_path_);
+        }
     }
     if (to_stdout_) {
-        const std::string line = human_line(ev) + "\n";
-        std::fwrite(line.c_str(), 1, line.size(), stdout);
-        std::fflush(stdout);
+        const std::string line = telemetry_event_to_jsonl(ev) + "\n";
+        if (std::fwrite(line.c_str(), 1, line.size(), stdout) != line.size() ||
+            std::fflush(stdout) == EOF) {
+            throw Error(ErrorCode::Io, "failed to write JSONL telemetry to stdout");
+        }
     }
+    ++emitted_;
     return ev.sequence;
 }
 
 void TelemetrySink::flush() {
     std::lock_guard lock(mu_);
-    if (human_stream_) static_cast<std::ofstream*>(human_stream_)->flush();
-    if (jsonl_stream_) static_cast<std::ofstream*>(jsonl_stream_)->flush();
+    if (human_stream_) {
+        auto& stream = *static_cast<std::ofstream*>(human_stream_);
+        stream.flush();
+        if (!stream) {
+            throw Error(ErrorCode::Io, "failed to flush human telemetry",
+                        human_path_);
+        }
+    }
+    if (jsonl_stream_) {
+        auto& stream = *static_cast<std::ofstream*>(jsonl_stream_);
+        stream.flush();
+        if (!stream) {
+            throw Error(ErrorCode::Io, "failed to flush JSONL telemetry",
+                        jsonl_path_);
+        }
+    }
+}
+
+uint64_t TelemetrySink::events_emitted() const noexcept {
+    std::lock_guard lock(mu_);
+    return emitted_;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +337,7 @@ void TelemetryAggregator::record(const TelemetryEvent& ev) {
             break;
         case EventType::Evict:
             ++agg_.evictions;
-            if (ev.reason == "writeback" || ev.dst == Tier::Nvme) ++agg_.writebacks;
+            if (ev.reason == "writeback") ++agg_.writebacks;
             break;
         case EventType::PrefetchIssue:
             ++agg_.prefetches_issued;
@@ -323,11 +363,9 @@ void TelemetryAggregator::record(const TelemetryEvent& ev) {
             break;
     }
 
-    if (ev.type == EventType::PageAlloc) {
-        if (ev.dst == Tier::Vram) agg_.max_vram_resident = std::max(agg_.max_vram_resident, ev.vram_used);
-        if (ev.dst == Tier::HostPinned) agg_.max_host_resident = std::max(agg_.max_host_resident, ev.host_used);
-        if (ev.dst == Tier::Nvme) agg_.max_nvme_resident = std::max(agg_.max_nvme_resident, ev.nvme_used);
-    }
+    agg_.max_vram_resident = std::max(agg_.max_vram_resident, ev.vram_used);
+    agg_.max_host_resident = std::max(agg_.max_host_resident, ev.host_used);
+    agg_.max_nvme_resident = std::max(agg_.max_nvme_resident, ev.nvme_used);
 }
 
 TelemetryAggregates TelemetryAggregator::summary() const {

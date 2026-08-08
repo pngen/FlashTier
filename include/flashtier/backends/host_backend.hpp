@@ -2,7 +2,7 @@
 
 #include <cstdint>
 #include <mutex>
-#include <unordered_set>
+#include <unordered_map>
 
 #include "flashtier/tier.hpp"
 
@@ -45,10 +45,17 @@ public:
     uint64_t headroom() const noexcept;
     uint64_t high_water() const noexcept;
     bool uses_pinned() const noexcept;
+    Tier allocation_tier(void* ptr) const;
 
 private:
+    struct Allocation {
+        uint64_t bytes = 0;
+        DeviceBackend* device = nullptr;  // non-null when vendor-pinned
+    };
+
     void* allocate_fallback(uint64_t bytes);
     void free_fallback(void* ptr);
+    uint64_t usable_limit_locked() const noexcept;
 
     mutable std::mutex mu_;
     DeviceBackend* device_ = nullptr;
@@ -57,7 +64,7 @@ private:
     uint64_t used_ = 0;
     uint64_t high_water_ = 0;
     double margin_ = 0.0;
-    std::unordered_set<void*> pinned_ptrs_;  // allocations owned by the device backend
+    std::unordered_map<void*, Allocation> allocations_;
 };
 
 }  // namespace flashtier

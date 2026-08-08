@@ -2,6 +2,7 @@
 
 #include <vector>
 
+#include "flashtier/error.hpp"
 #include "flashtier/policy.hpp"
 
 using namespace flashtier;
@@ -76,12 +77,22 @@ FT_TEST(predictive_prefers_hot_and_pinned_pages) {
     FT_ASSERT_EQ(victims.front().value, 1u); // coldest is the best victim
 }
 
-FT_TEST(predictive_prefers_dirty_writes_for_eviction_penalty) {
+FT_TEST(predictive_keeps_dirty_pages_when_other_metadata_matches) {
     PredictivePolicy p;
     PageMetadata clean = make_page(1, 50, 5);
     PageMetadata dirty = make_page(2, 51, 5);
     dirty.dirty = true;
-    FT_ASSERT(p.score(dirty) < p.score(clean));
+    FT_ASSERT(p.score(dirty) > p.score(clean));
+}
+
+FT_TEST(predictive_recency_increases_with_access_sequence) {
+    PredictivePolicy p;
+    PageMetadata older = make_page(1, 10, 5);
+    PageMetadata newer = make_page(2, 1000, 5);
+    FT_ASSERT(p.score(newer) > p.score(older));
+
+    const auto victims = p.rank_victims({newer, older});
+    FT_ASSERT_EQ(victims.front().value, older.id.value);
 }
 
 FT_TEST(predictive_class_weights_matter) {
@@ -113,6 +124,11 @@ FT_TEST(rank_prefetch_orders_promotion_candidates) {
     };
     auto order = p.rank_prefetch(cands);
     FT_ASSERT_EQ(order[0].value, 2u);  // hottest first
+}
+
+FT_TEST(make_policy_rejects_unknown_enum_instead_of_falling_back) {
+    FT_ASSERT_THROWS(make_policy(static_cast<PolicyKind>(99)),
+                     ErrorCode::InvalidArgument);
 }
 
 int main() { return ft_test::run_all("test_policy"); }

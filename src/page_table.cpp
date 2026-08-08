@@ -48,7 +48,14 @@ void PageTable::with(PageId id, const std::function<void(const PageMetadata&)>& 
 
 void PageTable::insert(PageMetadata meta) {
     std::unique_lock lock(mu_);
-    pages_.insert_or_assign(meta.id.value, std::move(meta));
+    const PageId id = meta.id;
+    const auto [it, inserted] = pages_.emplace(id.value, std::move(meta));
+    (void)it;
+    if (!inserted) {
+        throw Error(ErrorCode::Invariant,
+                    "duplicate page ID insertion would overwrite live metadata",
+                    id.to_string());
+    }
 }
 
 void PageTable::erase(PageId id) {

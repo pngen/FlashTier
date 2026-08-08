@@ -4,13 +4,22 @@
 // capacity validation before allocation, reserve margins, and no claims
 // beyond what is measured.
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
 #include <filesystem>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "flashtier/backends/backend_registry.hpp"
 #include "flashtier/backends/device_backend.hpp"
@@ -36,10 +45,47 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 std::string temp_store_path(const char* tag) {
+    static std::atomic<uint64_t> sequence{0};
+#if defined(_WIN32)
+    const int pid = _getpid();
+#else
+    const int pid = static_cast<int>(::getpid());
+#endif
+    const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
     return (std::filesystem::temp_directory_path() /
-            (std::string("ft-") + tag + "-store-" + std::to_string(::time(nullptr)) + ".bin"))
+            (std::string("ft-") + tag + "-store-" + std::to_string(pid) + "-" +
+             std::to_string(tick) + "-" + std::to_string(sequence.fetch_add(1)) + ".bin"))
         .string();
 }
+
+class StoreFileCleanup final {
+public:
+    StoreFileCleanup(std::string path, bool retain)
+        : path_(std::move(path)), retain_(retain) {}
+
+    void arm() noexcept { armed_ = true; }
+
+    void remove_now() {
+        if (!armed_ || retain_) return;
+        NvmeBackend::destroy_file(path_);
+        armed_ = false;
+    }
+
+    ~StoreFileCleanup() noexcept {
+        try {
+            remove_now();
+        } catch (...) {
+            // Exception unwinding must preserve the causal benchmark error.
+            // Successful paths call remove_now() explicitly so cleanup
+            // failures remain visible to the caller.
+        }
+    }
+
+private:
+    std::string path_;
+    bool retain_ = false;
+    bool armed_ = false;
+};
 
 // Resolve the device backend for a benchmark run (same rules as the
 // runtime: --backend explicit or automatic with cpu fallback). Never
@@ -48,19 +94,41 @@ std::unique_ptr<DeviceBackend> resolve_bench_backend(const cli::Options& o,
                                                      std::string& backend_name,
                                                      std::string& reason) {
     BackendRegistry& registry = BackendRegistry::instance();
-    std::string name = o.backend.empty() || o.backend == "auto"
-                           ? registry.select_automatic(reason)
-                           : o.backend;
-    if (!registry.has(name)) {
-        throw Error(ErrorCode::Config,
-                    "requested backend is not compiled into this build: " + name);
+    std::string name;
+    if (o.no_cuda) {
+        if (!o.backend.empty() && o.backend != "auto" && o.backend != "cpu") {
+            throw Error(ErrorCode::Config,
+                        "--no-cuda conflicts with explicit backend '" + o.backend + "'");
+        }
+        name = "cpu";
+        reason = "CPU-only mode requested (--no-cuda)";
+    } else {
+        name = o.backend.empty() || o.backend == "auto"
+                   ? registry.select_automatic(reason)
+                   : o.backend;
     }
     backend_name = name;
     if (name == "cpu") {
         reason = "cpu backend: CPU-only mode (no accelerator tier)";
         return nullptr;
     }
-    return registry.create(name);
+    if (!registry.has(name)) {
+        throw Error(ErrorCode::Config,
+                    "requested backend is not compiled into this build: " + name);
+    }
+    std::unique_ptr<DeviceBackend> dev = registry.create(name);
+    const std::vector<DeviceInfo> devices = dev->enumerate_devices();
+    if (devices.empty()) {
+        throw Error(ErrorCode::Unsupported,
+                    "requested accelerator backend has no available device: " + name);
+    }
+    if (o.device_id < 0 || static_cast<std::size_t>(o.device_id) >= devices.size()) {
+        throw Error(ErrorCode::Config,
+                    "device index is out of range for backend '" + name + "'",
+                    "requested " + std::to_string(o.device_id) + ", available " +
+                        std::to_string(devices.size()));
+    }
+    return dev;
 }
 
 struct BenchHeader {
@@ -80,14 +148,9 @@ BenchHeader probe_header(const cli::Options& o) {
     std::unique_ptr<DeviceBackend> dev = resolve_bench_backend(o, h.backend, reason);
     if (dev != nullptr) {
         const std::vector<DeviceInfo> devices = dev->enumerate_devices();
-        if (!devices.empty()) {
-            const DeviceInfo& d = devices[static_cast<std::size_t>(
-                std::min(o.device_id, static_cast<int>(devices.size()) - 1))];
-            h.device = d.name;
-            h.arch = d.architecture;
-        } else {
-            h.device = "(backend '" + h.backend + "' compiled but no devices)";
-        }
+        const DeviceInfo& d = devices[static_cast<std::size_t>(o.device_id)];
+        h.device = d.name;
+        h.arch = d.architecture;
     } else {
         h.device = "(no accelerator; CPU-only mode)";
     }
@@ -117,6 +180,15 @@ struct EffectiveBudgets {
     bool device_shared_memory = false;
 };
 
+bool fits_tier_capacity(uint64_t bytes, const EffectiveBudgets& budgets) noexcept {
+    uint64_t remaining = bytes;
+    const uint64_t in_vram = std::min(remaining, budgets.vram);
+    remaining -= in_vram;
+    const uint64_t in_host = std::min(remaining, budgets.host);
+    remaining -= in_host;
+    return remaining <= budgets.nvme;
+}
+
 // Effective budgets for a benchmark with explicit safe-sizing checks:
 // refuses budgets that exceed detected free capacity, and caps automatic
 // defaults so local validation stays small and bounded. Explicit
@@ -135,11 +207,11 @@ EffectiveBudgets resolve_budgets(const cli::Options& o, double vram_fraction,
     std::unique_ptr<DeviceBackend> dev = resolve_bench_backend(o, b.backend, reason);
     if (dev != nullptr) {
         const std::vector<DeviceInfo> devices = dev->enumerate_devices();
-        if (devices.empty()) {
-            b.vram = 0;
-        } else {
-            const int idx = std::min(o.device_id, static_cast<int>(devices.size()) - 1);
+        const int idx = o.device_id;
+        bool opened = false;
+        try {
             dev->open(idx);
+            opened = true;
             b.free_vram = dev->free_memory();
             b.device_name = devices[static_cast<std::size_t>(idx)].name;
             b.device_shared_memory = devices[static_cast<std::size_t>(idx)].memory_shared;
@@ -157,9 +229,22 @@ EffectiveBudgets resolve_budgets(const cli::Options& o, double vram_fraction,
             }
             b.vram = wanted;
             dev->close();
+            opened = false;
+        } catch (...) {
+            if (opened) {
+                try {
+                    dev->close();
+                } catch (...) {
+                }
+            }
+            throw;
         }
     } else {
         b.vram = 0;
+        if (o.vram_budget_bytes != 0) {
+            throw Error(ErrorCode::Unsupported,
+                        "a device-memory budget requires an accelerator backend");
+        }
     }
 
     b.host = o.host_budget_bytes != 0
@@ -220,11 +305,22 @@ std::string yes_no_str(bool v) { return v ? "yes" : "no"; }
 // explicit --working-set / budget flags; defaults never scale with total
 // free RAM or VRAM.
 constexpr uint64_t kBenchVramCap = 1ull << 30;        // 1 GiB
+constexpr uint64_t kBenchUnifiedVramCap = 256ull << 20; // 256 MiB (512 MiB WS)
 constexpr uint64_t kBenchHostCap = 512ull << 20;      // 512 MiB
 constexpr uint64_t kBenchNvmeCap = 8ull << 30;        // 8 GiB
 constexpr uint64_t kBenchCpuHostBudget = 128ull << 20;  // CPU-only host budget
 constexpr uint64_t kBenchMaxWorkingSet = 256ull << 20;  // 256 MiB
 constexpr uint64_t kBenchMaxExperts = 128;
+
+bool validate_benchmark_config(const Config& cfg) {
+    const auto validation =
+        validate_config(cfg, BackendRegistry::instance().compiled_backends());
+    if (validation.ok) return true;
+    for (const auto& e : validation.errors) {
+        std::fprintf(stderr, "config: %s\n", e.c_str());
+    }
+    return false;
+}
 
 // Map a typed runtime error to a CLI exit code.
 int exit_for_error(const Error& e) {
@@ -256,6 +352,7 @@ void report_error(const Error& e) {
 int run_tiers(const cli::Options& o) {
     const BenchHeader h = probe_header(o);
     Config cfg = base_config(o);
+    if (!validate_benchmark_config(cfg)) return cli::kExitUsage;
     std::printf("=== FlashTier benchmark: tiers ===\n");
     std::printf("device: %s\n", h.device.c_str());
     std::printf("os: %s | cpu: %s\n", h.os.c_str(), h.cpu.c_str());
@@ -267,6 +364,28 @@ int run_tiers(const cli::Options& o) {
     if (buf_bytes % page_size != 0) {
         std::fprintf(stderr, "flashtier: tier buffer must be a multiple of page size\n");
         return cli::kExitUsage;
+    }
+    if (buf_bytes > std::numeric_limits<std::size_t>::max() ||
+        buf_bytes > std::numeric_limits<uint64_t>::max() / 2) {
+        throw Error(ErrorCode::Budget, "tier benchmark buffer is too large");
+    }
+    const SystemInfo system = probe_system(o.device_id, o.nvme_path);
+    if (system.free_ram_bytes == 0 || buf_bytes > system.free_ram_bytes / 2) {
+        throw Error(ErrorCode::Budget,
+                    "tier benchmark requires two host buffers within available RAM",
+                    "buffer " + std::to_string(buf_bytes) +
+                        " free RAM " + std::to_string(system.free_ram_bytes));
+    }
+    const uint64_t store_capacity =
+        std::max<uint64_t>(buf_bytes * 2, 64ull * 1024 * 1024);
+    if (store_capacity > std::numeric_limits<uint64_t>::max() - page_size ||
+        system.disk_free_bytes == 0 ||
+        store_capacity + page_size > system.disk_free_bytes) {
+        throw Error(ErrorCode::Budget,
+                    "tier benchmark store exceeds free space on the backing volume",
+                    "payload " + std::to_string(store_capacity) +
+                        " plus header " + std::to_string(page_size) +
+                        " free " + std::to_string(system.disk_free_bytes));
     }
 
     struct Row {
@@ -295,13 +414,7 @@ int run_tiers(const cli::Options& o) {
     std::string reason;
     std::unique_ptr<DeviceBackend> dev = resolve_bench_backend(o, backend_name, reason);
     if (dev != nullptr) {
-        const std::vector<DeviceInfo> devices = dev->enumerate_devices();
-        if (devices.empty()) {
-            dev.reset();
-        }
-    }
-    if (dev != nullptr) {
-        const int idx = std::min(o.device_id, static_cast<int>(dev->enumerate_devices().size()) - 1);
+        const int idx = o.device_id;
         dev->open(idx);
         DeviceStream* stream = dev->create_stream();
         DeviceEvent* ev_start = dev->create_event();
@@ -366,23 +479,17 @@ int run_tiers(const cli::Options& o) {
         // NVMe store for the remaining paths.
         const std::string store_path = o.nvme_path.empty()
                                            ? temp_store_path("tiers")
-                                           : o.nvme_path + "/ft-tiers-store.bin";
+                                           : o.nvme_path;
+        StoreFileCleanup cleanup(store_path, o.retain_store);
         NvmeBackend store;
-        store.open(store_path, std::max<uint64_t>(buf_bytes * 2, 64ull * 1024 * 1024),
-                   page_size);
+        store.open(store_path, store_capacity, page_size);
+        cleanup.arm();
         const uint64_t k_extents = buf_bytes / page_size;
-        std::vector<uint64_t> region;
-        region.reserve(k_extents);
-        for (uint64_t i = 0; i < k_extents; ++i) {
-            uint64_t off = 0;
-            if (!store.allocate_extent(off)) {
-                std::fprintf(stderr, "flashtier: store too small for tier benchmark\n");
-                return cli::kExitUsage;
-            }
-            region.push_back(off);
+        uint64_t base = 0;
+        if (!store.allocate_extents(k_extents, base)) {
+            throw Error(ErrorCode::Budget,
+                        "store lacks a contiguous region for the tier benchmark");
         }
-        std::sort(region.begin(), region.end());
-        const uint64_t base = region.front();
 
         // 4. host -> NVMe
         {
@@ -452,8 +559,9 @@ int run_tiers(const cli::Options& o) {
                             best_us});
         }
 
+        store.free_extents(base, k_extents);
         store.close();
-        NvmeBackend::destroy_file(store_path);
+        cleanup.remove_now();
         dev->free_host_pinned(pinned);
         dev->destroy_event(ev_end);
         dev->destroy_event(ev_start);
@@ -465,23 +573,17 @@ int run_tiers(const cli::Options& o) {
         // the CUDA rows report an explicit unsupported result.
         const std::string store_path = o.nvme_path.empty()
                                            ? temp_store_path("tiers")
-                                           : o.nvme_path + "/ft-tiers-store.bin";
+                                           : o.nvme_path;
+        StoreFileCleanup cleanup(store_path, o.retain_store);
         NvmeBackend store;
-        store.open(store_path, std::max<uint64_t>(buf_bytes * 2, 64ull * 1024 * 1024),
-                   page_size);
+        store.open(store_path, store_capacity, page_size);
+        cleanup.arm();
         const uint64_t k_extents = buf_bytes / page_size;
-        std::vector<uint64_t> region;
-        region.reserve(k_extents);
-        for (uint64_t i = 0; i < k_extents; ++i) {
-            uint64_t off = 0;
-            if (!store.allocate_extent(off)) {
-                std::fprintf(stderr, "flashtier: store too small for tier benchmark\n");
-                return cli::kExitUsage;
-            }
-            region.push_back(off);
+        uint64_t base = 0;
+        if (!store.allocate_extents(k_extents, base)) {
+            throw Error(ErrorCode::Budget,
+                        "store lacks a contiguous region for the tier benchmark");
         }
-        std::sort(region.begin(), region.end());
-        const uint64_t base = region.front();
         std::vector<uint8_t> buf(buf_bytes, 0x44);
         {
             double best_us = 0.0;
@@ -507,13 +609,14 @@ int run_tiers(const cli::Options& o) {
             }
             rows.push_back({"nvme->host", gbps(buf_bytes, best_us / 1e6), best_us});
         }
+        store.free_extents(base, k_extents);
         store.close();
-        NvmeBackend::destroy_file(store_path);
+        cleanup.remove_now();
 
-        rows.push_back({"pinned_host->vram", 0.0, 0.0});
-        rows.push_back({"vram->pinned_host", 0.0, 0.0});
-        rows.push_back({"nvme->host->vram (full)", 0.0, 0.0});
-        rows.push_back({"vram->host->nvme (full)", 0.0, 0.0});
+        rows.push_back({"pinned_host->device", 0.0, 0.0});
+        rows.push_back({"device->pinned_host", 0.0, 0.0});
+        rows.push_back({"nvme->host->device (full)", 0.0, 0.0});
+        rows.push_back({"device->host->nvme (full)", 0.0, 0.0});
     }
 
     std::printf("\nTier bandwidth (best of 8, buffer %zu bytes):\n",
@@ -545,7 +648,6 @@ int run_oversubscription(const cli::Options& o) {
     }
 
     Config cfg = base_config(o);
-    if (!FLASHTIER_HAVE_CUDA) cfg.cuda_enabled = false;  // CPU-only builds run host/NVMe tiers
     if (o.vram_budget_bytes == 0 && b.vram != 0) cfg.vram_budget_bytes = b.vram;
     if (o.host_budget_bytes == 0) cfg.host_budget_bytes = b.host;
     if (o.nvme_budget_bytes == 0) cfg.nvme_budget_bytes = b.nvme;
@@ -553,37 +655,53 @@ int run_oversubscription(const cli::Options& o) {
     const BenchHeader h = probe_header(o);
     print_header("oversubscription", h, cfg);
 
-    const auto validation = validate_config(cfg, BackendRegistry::instance().compiled_backends());
-    if (!validation.ok) {
-        for (const auto& e : validation.errors) {
-            std::fprintf(stderr, "config: %s\n", e.c_str());
-        }
-        return cli::kExitUsage;
-    }
+    if (!validate_benchmark_config(cfg)) return cli::kExitUsage;
 
     Runtime rt(cfg);
     rt.start();
     emit_begin(rt, "oversubscription", cfg);
 
     const uint64_t base_tier = b.vram != 0 ? b.vram : b.host;
+    if (base_tier == 0) {
+        rt.shutdown();
+        throw Error(ErrorCode::Budget, "effective hot-tier budget is zero");
+    }
     const double ratios[] = {1.00, 1.25, 1.50, 2.00};
+    std::vector<uint64_t> working_sets;
+    if (o.working_set_bytes != 0) {
+        if (o.working_set_bytes % cfg.page_size != 0) {
+            rt.shutdown();
+            throw Error(ErrorCode::Config,
+                        "oversubscription working set must be a multiple of page size");
+        }
+        working_sets.push_back(o.working_set_bytes);
+    } else {
+        for (const double ratio : ratios) {
+            const uint64_t ws =
+                static_cast<uint64_t>(static_cast<double>(base_tier) * ratio);
+            working_sets.push_back((ws / cfg.page_size) * cfg.page_size);
+        }
+    }
 
     uint64_t total_ops = 0;
     double total_seconds = 0.0;
+    uint64_t phases_run = 0;
+    bool exercised_oversubscription = false;
     int rc = cli::kExitOk;
-    for (const double ratio : ratios) {
-        const uint64_t ws = static_cast<uint64_t>(static_cast<double>(base_tier) * ratio);
-        const uint64_t ws_pages = ws / cfg.page_size;
-        const uint64_t logical_ws = ws_pages * cfg.page_size;
+    for (const uint64_t logical_ws : working_sets) {
+        const uint64_t ws_pages = logical_ws / cfg.page_size;
         if (ws_pages == 0) continue;
+        const double ratio =
+            static_cast<double>(logical_ws) / static_cast<double>(base_tier);
 
         // Safety: the full working set must fit host + NVMe budgets.
-        const uint64_t spill = logical_ws > b.vram ? logical_ws - b.vram : 0;
-        if (spill > b.host + b.nvme) {
+        if (!fits_tier_capacity(logical_ws, b)) {
             std::printf("phase ratio=%.2f: skipped (working set %s does not fit host+NVMe budgets)\n",
                         ratio, bytesize_to_string(logical_ws).c_str());
             continue;
         }
+        ++phases_run;
+        exercised_oversubscription = exercised_oversubscription || logical_ws > base_tier;
 
         std::printf("phase ratio=%.2f logical=%s pages=%llu\n", ratio,
                     bytesize_to_string(logical_ws).c_str(),
@@ -628,7 +746,7 @@ int run_oversubscription(const cli::Options& o) {
                 ++verified;
             }
         }
-        const auto agg = rt.aggregates();
+        auto agg = rt.aggregates();
         std::printf("  accesses=%llu throughput=%.1f ops/s\n",
                     static_cast<unsigned long long>(trace.accesses().size()),
                     static_cast<double>(trace.accesses().size()) / secs);
@@ -657,8 +775,18 @@ int run_oversubscription(const cli::Options& o) {
              total_seconds > 0.0 ? static_cast<double>(total_ops) / total_seconds : 0.0);
     rt.shutdown();
     if (rc != cli::kExitOk) return rc;
-    std::printf("oversubscription: OK (working sets exceeded the %s budget without failure)\n",
-                bytesize_to_string(b.vram != 0 ? b.vram : b.host).c_str());
+    if (phases_run == 0) {
+        std::fprintf(stderr, "flashtier: no oversubscription phase fit the configured budgets\n");
+        return cli::kExitUsage;
+    }
+    if (exercised_oversubscription) {
+        std::printf("oversubscription: OK (working set exceeded the %s budget without failure)\n",
+                    bytesize_to_string(base_tier).c_str());
+    } else {
+        std::printf("oversubscription: completed, but the explicit working set did not exceed "
+                    "the %s hot-tier budget\n",
+                    bytesize_to_string(base_tier).c_str());
+    }
     return cli::kExitOk;
 }
 
@@ -675,31 +803,41 @@ int run_prefetch(const cli::Options& o) {
         b.vram != 0 ? b.vram : std::min(b.host, kBenchCpuHostBudget);
 
     Config cfg = base_config(o);
-    if (!FLASHTIER_HAVE_CUDA) cfg.cuda_enabled = false;  // CPU-only builds run host/NVMe tiers
     if (o.vram_budget_bytes == 0 && b.vram != 0) cfg.vram_budget_bytes = b.vram;
     if (o.host_budget_bytes == 0) cfg.host_budget_bytes = b.vram != 0 ? b.host : base_tier;
     if (o.nvme_budget_bytes == 0) cfg.nvme_budget_bytes = b.nvme;
 
-    const BenchHeader h = probe_header(o);
-    print_header("prefetch", h, cfg);
+    if (!validate_benchmark_config(cfg)) return cli::kExitUsage;
 
     // Bounded default: at most 256 MiB; larger runs require --working-set.
-    const uint64_t ws = o.working_set_bytes != 0
-                            ? o.working_set_bytes
-                            : std::min(base_tier * 2, kBenchMaxWorkingSet);
+    if (o.working_set_bytes != 0 && o.working_set_bytes % cfg.page_size != 0) {
+        std::fprintf(stderr,
+                     "flashtier: prefetch working set must be a multiple of page size\n");
+        return cli::kExitUsage;
+    }
+    const uint64_t default_ws =
+        base_tier > kBenchMaxWorkingSet / 2 ? kBenchMaxWorkingSet : base_tier * 2;
+    const uint64_t ws =
+        o.working_set_bytes != 0 ? o.working_set_bytes : default_ws;
     const uint64_t ws_pages = ws / cfg.page_size;
     const uint64_t logical_ws = ws_pages * cfg.page_size;
     if (ws_pages == 0) {
         std::fprintf(stderr, "flashtier: working set too small for page size\n");
         return cli::kExitUsage;
     }
-    if (logical_ws > b.host + b.nvme) {
+    if (!fits_tier_capacity(logical_ws, b)) {
         std::fprintf(stderr,
-                     "flashtier: working set %s does not fit host+NVMe budgets (%s)\n",
-                     bytesize_to_string(logical_ws).c_str(),
-                     bytesize_to_string(b.host + b.nvme).c_str());
+                     "flashtier: working set %s does not fit the configured tier budgets\n",
+                     bytesize_to_string(logical_ws).c_str());
         return cli::kExitUsage;
     }
+    if (ws_pages > std::numeric_limits<uint64_t>::max() / 8) {
+        std::fprintf(stderr, "flashtier: prefetch trace size overflows\n");
+        return cli::kExitUsage;
+    }
+    cfg.working_set_bytes = logical_ws;
+    const BenchHeader h = probe_header(o);
+    print_header("prefetch", h, cfg);
 
     // Partially predictable trace: 75% sequential + 25% random bursts.
     const uint64_t ops = ws_pages * 8;
@@ -780,7 +918,7 @@ int run_prefetch(const cli::Options& o) {
             rt.read_page(ids[annotated[i].page_id], buf.data());
         }
         const double secs = std::chrono::duration<double>(Clock::now() - t0).count();
-        const auto agg = rt.aggregates();
+        auto agg = rt.aggregates();
 
         results[m].ops_per_s = static_cast<double>(annotated.size()) / secs;
         results[m].stall_ms = agg.total_stall_us / 1000.0;
@@ -796,6 +934,7 @@ int run_prefetch(const cli::Options& o) {
                 ++verified;
             }
         }
+        agg = rt.aggregates();
         std::printf("prefetch=%s: throughput=%.1f ops/s stalls=%.1fms faults=%llu "
                     "prefetch issued=%llu hits=%llu waste=%llu integrity=%llu ok\n",
                     labels[m], results[m].ops_per_s, results[m].stall_ms,
@@ -837,26 +976,45 @@ int run_sparse_experts(const cli::Options& o) {
         b.vram != 0 ? b.vram : std::min(b.host, kBenchCpuHostBudget);
 
     Config cfg = base_config(o);
-    if (!FLASHTIER_HAVE_CUDA) cfg.cuda_enabled = false;  // CPU-only builds run host/NVMe tiers
     if (o.vram_budget_bytes == 0 && b.vram != 0) cfg.vram_budget_bytes = b.vram;
     if (o.host_budget_bytes == 0) cfg.host_budget_bytes = b.vram != 0 ? b.host : base_tier;
     if (o.nvme_budget_bytes == 0) cfg.nvme_budget_bytes = b.nvme;
 
-    const BenchHeader h = probe_header(o);
-    print_header("sparse-experts", h, cfg);
+    if (!validate_benchmark_config(cfg)) return cli::kExitUsage;
 
     // Bounded synthetic workload; larger hardware runs need explicit sizes.
-    const uint64_t expert_count = std::min<uint64_t>(
-        kBenchMaxExperts, std::max<uint64_t>(16, (base_tier / cfg.page_size) * 2));
-    const uint64_t hot_count = std::max<uint64_t>(1, expert_count / 16);
-    const uint64_t active_per_token = 2;
-    const uint64_t tokens = std::min<uint64_t>(
-        2048, std::max<uint64_t>(1, (expert_count * 8) / active_per_token));
-
-    if (expert_count * cfg.page_size > b.host + b.nvme) {
-        std::fprintf(stderr, "flashtier: expert working set exceeds host+NVMe budgets\n");
+    if (o.working_set_bytes != 0 && o.working_set_bytes % cfg.page_size != 0) {
+        std::fprintf(stderr,
+                     "flashtier: sparse-expert working set must be a multiple of page size\n");
         return cli::kExitUsage;
     }
+    const uint64_t base_pages = base_tier / cfg.page_size;
+    const uint64_t default_experts =
+        base_pages > kBenchMaxExperts / 2 ? kBenchMaxExperts : base_pages * 2;
+    const uint64_t expert_count =
+        o.working_set_bytes != 0
+            ? o.working_set_bytes / cfg.page_size
+            : std::min<uint64_t>(kBenchMaxExperts,
+                                 std::max<uint64_t>(16, default_experts));
+    if (expert_count < 2) {
+        std::fprintf(stderr,
+                     "flashtier: sparse-expert working set requires at least two pages\n");
+        return cli::kExitUsage;
+    }
+    const uint64_t hot_count = std::max<uint64_t>(1, expert_count / 16);
+    const uint64_t active_per_token = 2;
+    const uint64_t tokens =
+        expert_count >= 512 ? 2048 : std::max<uint64_t>(1, expert_count * 4);
+
+    const uint64_t logical_ws = expert_count * cfg.page_size;
+    if (!fits_tier_capacity(logical_ws, b)) {
+        std::fprintf(stderr,
+                     "flashtier: expert working set exceeds the configured tier budgets\n");
+        return cli::kExitUsage;
+    }
+    cfg.working_set_bytes = logical_ws;
+    const BenchHeader h = probe_header(o);
+    print_header("sparse-experts", h, cfg);
 
     std::printf("experts=%llu hot=%llu active_per_token=%llu tokens=%llu zipf=1.2\n",
                 static_cast<unsigned long long>(expert_count),
@@ -914,7 +1072,7 @@ int run_sparse_experts(const cli::Options& o) {
             rt.read_page(ids[annotated[i].page_id], buf.data());
         }
         const double secs = std::chrono::duration<double>(Clock::now() - t0).count();
-        const auto agg = rt.aggregates();
+        auto agg = rt.aggregates();
 
         results[m].ops_per_s = static_cast<double>(annotated.size()) / secs;
         results[m].stall_ms = agg.total_stall_us / 1000.0;
@@ -926,6 +1084,7 @@ int run_sparse_experts(const cli::Options& o) {
             rt.verify_page(ids[i]);
             ++verified;
         }
+        agg = rt.aggregates();
         std::printf("mode=%s: throughput=%.1f ops/s stalls=%.1fms faults=%llu "
                     "vram_hit=%.1f%% integrity=%llu ok\n",
                     labels[m], results[m].ops_per_s, results[m].stall_ms,
@@ -959,6 +1118,8 @@ int run_sparse_experts(const cli::Options& o) {
 
 int run_unified_memory(const cli::Options& o) {
 #if FLASHTIER_HAVE_CUDA
+    Config requested_cfg = base_config(o);
+    if (!validate_benchmark_config(requested_cfg)) return cli::kExitUsage;
     // This comparison is CUDA-specific by definition (cudaMallocManaged
     // vs FlashTier's explicit strategy); it requires the cuda backend.
     std::string backend_name;
@@ -976,7 +1137,7 @@ int run_unified_memory(const cli::Options& o) {
         std::printf("unsupported: cuda backend compiled but no device available\n");
         return cli::kExitUnsupported;
     }
-    const int idx = std::min(o.device_id, static_cast<int>(devices.size()) - 1);
+    const int idx = o.device_id;
     dev->open(idx);
     const DeviceCapabilities caps = dev->capabilities();
     const DeviceInfo& gpu = devices[static_cast<std::size_t>(idx)];
@@ -992,9 +1153,27 @@ int run_unified_memory(const cli::Options& o) {
                                      ? o.vram_budget_bytes
                                      : std::min(
                                            static_cast<uint64_t>(static_cast<double>(gpu.free_memory) * 0.50),
-                                           kBenchVramCap);
+                                           kBenchUnifiedVramCap);
+    if (vram_budget == 0 || vram_budget > gpu.free_memory) {
+        std::fprintf(stderr,
+                     "flashtier: device-memory budget %s exceeds free device memory %s\n",
+                     bytesize_to_string(vram_budget).c_str(),
+                     bytesize_to_string(gpu.free_memory).c_str());
+        return cli::kExitUsage;
+    }
     // Bounded default (2 GiB max); larger runs require explicit sizes.
-    const uint64_t ws = o.working_set_bytes != 0 ? o.working_set_bytes : vram_budget * 2;
+    if (o.working_set_bytes == 0 &&
+        vram_budget > std::numeric_limits<uint64_t>::max() / 2) {
+        std::fprintf(stderr, "flashtier: unified-memory working set overflows\n");
+        return cli::kExitUsage;
+    }
+    const uint64_t ws =
+        o.working_set_bytes != 0 ? o.working_set_bytes : vram_budget * 2;
+    if (ws == 0 || ws % o.page_size != 0) {
+        std::fprintf(stderr,
+                     "flashtier: unified-memory working set must be a nonzero multiple of page size\n");
+        return cli::kExitUsage;
+    }
     if (ws > gpu.free_memory) {
         std::fprintf(stderr,
                      "flashtier: unified-memory working set %s exceeds free device memory %s; "
@@ -1008,8 +1187,9 @@ int run_unified_memory(const cli::Options& o) {
     std::printf("device: %s (arch %s, UM=%s, CAM=%s)\n", gpu.name.c_str(),
                 gpu.architecture.c_str(), yes_no_str(caps.unified_memory).c_str(),
                 yes_no_str(caps.concurrent_managed_access).c_str());
-    std::printf("working set: %s (2x of %s device-memory budget)\n",
-                bytesize_to_string(ws).c_str(), bytesize_to_string(vram_budget).c_str());
+    std::printf("working set: %s; explicit device-memory budget: %s (%.2fx)\n",
+                bytesize_to_string(ws).c_str(), bytesize_to_string(vram_budget).c_str(),
+                static_cast<double>(ws) / static_cast<double>(vram_budget));
     std::printf("page size: %s, prefetch distance: %llu pages, iterations: %u, seed: %llu\n",
                 bytesize_to_string(o.page_size).c_str(),
                 static_cast<unsigned long long>(o.um_prefetch_pages), o.iterations,
@@ -1034,6 +1214,31 @@ int run_unified_memory(const cli::Options& o) {
     // Explicit FlashTier run over the same geometry.
     Config cfg = base_config(o);
     cfg.vram_budget_bytes = vram_budget;
+    const SystemInfo system = probe_system(o.device_id, o.nvme_path);
+    if (cfg.host_budget_bytes == 0) {
+        cfg.host_budget_bytes =
+            std::min<uint64_t>(system.free_ram_bytes / 4, 128ull * 1024 * 1024);
+    }
+    if (cfg.nvme_budget_bytes == 0) {
+        cfg.nvme_budget_bytes =
+            std::min<uint64_t>(system.disk_free_bytes / 4, 1024ull * 1024 * 1024);
+    }
+    if (cfg.host_budget_bytes > system.free_ram_bytes ||
+        cfg.nvme_budget_bytes > system.disk_free_bytes) {
+        std::fprintf(stderr,
+                     "flashtier: explicit host/NVMe budget exceeds detected free capacity\n");
+        return cli::kExitUsage;
+    }
+    if (cfg.host_budget_bytes == 0 || cfg.nvme_budget_bytes == 0 ||
+        cfg.host_budget_bytes >
+            std::numeric_limits<uint64_t>::max() - cfg.vram_budget_bytes ||
+        cfg.nvme_budget_bytes > std::numeric_limits<uint64_t>::max() -
+                                    cfg.vram_budget_bytes - cfg.host_budget_bytes ||
+        ws > cfg.vram_budget_bytes + cfg.host_budget_bytes + cfg.nvme_budget_bytes) {
+        std::fprintf(stderr,
+                     "flashtier: explicit strategy budgets cannot hold the working set\n");
+        return cli::kExitUsage;
+    }
     cfg.working_set_bytes = ws;
     cfg.prefetch = PrefetchKind::Sequential;
     cfg.prefetch_depth = static_cast<uint32_t>(o.um_prefetch_pages);
@@ -1050,6 +1255,7 @@ int run_unified_memory(const cli::Options& o) {
     for (uint64_t i = 0; i < ws_pages; ++i) {
         ids.push_back(rt.allocate_page(cfg.page_size));
     }
+    const auto explicit_t0 = Clock::now();
     for (uint64_t it = 0; it < cfg.iterations; ++it) {
         for (uint64_t p = 0; p < ws_pages; ++p) {
             const auto payload = page_payload(cfg.page_size, cfg.seed, ids[p].value);
@@ -1063,12 +1269,14 @@ int run_unified_memory(const cli::Options& o) {
             }
         }
     }
+    const double explicit_dur_s =
+        std::chrono::duration<double>(Clock::now() - explicit_t0).count();
     uint64_t mismatches = 0;
     for (uint64_t it = 0; it < cfg.iterations; ++it) {
         std::vector<uint8_t> buf(cfg.page_size);
         for (uint64_t p = 0; p < ws_pages; ++p) {
             rt.read_page(ids[p], buf.data());
-            if (verify_pattern(buf.data(), buf.size(), cfg.seed, ids[p].value, 64)
+            if (verify_pattern(buf.data(), buf.size(), cfg.seed, ids[p].value)
                     .has_value()) {
                 ++mismatches;
             }
@@ -1076,27 +1284,30 @@ int run_unified_memory(const cli::Options& o) {
     }
     const auto agg = rt.aggregates();
     const uint64_t explicit_ops = ws_pages * cfg.iterations;
-    const double explicit_dur_s =
-        agg.total_stall_us > 0 ? agg.total_stall_us / 1e6 : 1.0;
     std::printf("\n[FlashTier explicit VRAM/host/NVMe strategy, same geometry]\n");
     std::printf("  ops=%llu ops/s=%.1f demand_faults=%llu evictions=%llu writebacks=%llu "
                 "mismatches=%llu\n",
                 static_cast<unsigned long long>(explicit_ops),
-                static_cast<double>(explicit_ops) / explicit_dur_s,
+                explicit_dur_s > 0.0
+                    ? static_cast<double>(explicit_ops) / explicit_dur_s
+                    : 0.0,
                 static_cast<unsigned long long>(agg.demand_faults),
                 static_cast<unsigned long long>(agg.evictions),
                 static_cast<unsigned long long>(agg.writebacks),
                 static_cast<unsigned long long>(mismatches));
 
-    std::printf("\ncomparison scope: same machine, same working-set geometry, same page size, ");
-    std::printf("same deterministic touch pattern. Mechanisms differ: driver-managed paging vs ");
-    std::printf("FlashTier's explicit transfers. These numbers are not a latency-equivalence claim.\n");
+    std::printf("\ncomparison scope: same machine, working-set geometry, page size, page order, ");
+    std::printf("and iteration count. Touch granularity differs: the managed path writes one ");
+    std::printf("8-byte word per page while FlashTier transfers and verifies full pages. ");
+    std::printf("Throughput numbers are therefore not a latency-equivalence claim.\n");
     if (mismatches != 0) {
         rt.shutdown();
         return cli::kExitIntegrity;
     }
     emit_end(rt, "unified-memory/explicit",
-             static_cast<double>(explicit_ops) / explicit_dur_s);
+             explicit_dur_s > 0.0
+                 ? static_cast<double>(explicit_ops) / explicit_dur_s
+                 : 0.0);
     for (PageId id : ids) rt.free_page(id);
     rt.shutdown();
     return cli::kExitOk;
@@ -1125,7 +1336,7 @@ int run_benchmark_command(const cli::Options& o) {
         return exit_for_error(e);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "flashtier: benchmark failed: %s\n", e.what());
-        return cli::kExitError;
+        return cli::kExitBenchmarkFailed;
     }
 }
 
@@ -1137,7 +1348,7 @@ int guard(const cli::Options& o, int (*fn)(const cli::Options&)) {
         return exit_for_error(e);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "flashtier: benchmark failed: %s\n", e.what());
-        return cli::kExitError;
+        return cli::kExitBenchmarkFailed;
     }
 }
 

@@ -9,7 +9,11 @@ int main(int argc, char** argv) {
         flashtier::cli::print_version(stdout);
         return flashtier::cli::kExitOk;
     }
-    if (o.show_help || !o.errors.empty()) {
+    if (o.show_help) {
+        flashtier::cli::print_usage(stdout);
+        return flashtier::cli::kExitOk;
+    }
+    if (!o.errors.empty()) {
         for (const auto& e : o.errors) std::fprintf(stderr, "flashtier: %s\n", e.c_str());
         flashtier::cli::print_usage(stderr);
         return flashtier::cli::kExitUsage;

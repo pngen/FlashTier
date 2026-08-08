@@ -60,7 +60,7 @@ FT_TEST(planner_selects_oldest_victim_first) {
         page(1), page(2), page(3),
     };
     LruPolicy pol;
-    auto decisions = p.plan_evictions(100, cands, pol, 1000);
+    auto decisions = p.plan_evictions(100, cands, pol, 10ull * 1024 * 1024);
     FT_ASSERT_EQ(decisions.size(), 1u);
     FT_ASSERT_EQ(decisions[0].id.value, 1u);
     FT_ASSERT_EQ(decisions[0].target, Tier::HostPinned);
@@ -132,6 +132,30 @@ FT_TEST(planner_allocation_tier_priority) {
     FT_ASSERT_EQ(p3.choose_allocation_tier(100, false), Tier::Nvme);
     Planner p4(budgets(1000, 950, 100, 100, 10, 10));
     FT_ASSERT_THROWS(p4.choose_allocation_tier(100, false), ErrorCode::Budget);
+}
+
+FT_TEST(planner_handles_overcommitted_budget_without_unsigned_underflow) {
+    Planner p(budgets(1000, 950, 1000, 0, 1000, 0));
+    std::vector<PageMetadata> cands = {page(1)};
+    LruPolicy pol;
+    const auto decisions = p.plan_evictions(100, cands, pol, 1000);
+    FT_ASSERT_EQ(decisions.size(), 1u);
+
+    Planner p2(budgets(1000, 950, 1000, 1001, 1000, 1001));
+    FT_ASSERT_THROWS(p2.choose_allocation_tier(100, false), ErrorCode::Budget);
+}
+
+FT_TEST(planner_does_not_overbook_host_across_eviction_plan) {
+    Planner p(budgets(1000, 880, 1000, 0, 1000, 0));
+    std::vector<PageMetadata> cands = {page(1), page(2)};
+    LruPolicy pol;
+    const uint64_t one_page = cands.front().allocation_size;
+    // Existing VRAM headroom is 20 bytes, so one full page plus one more
+    // byte requires two victims.
+    const auto decisions = p.plan_evictions(20 + one_page + 1, cands, pol, one_page);
+    FT_ASSERT_EQ(decisions.size(), 2u);
+    FT_ASSERT_EQ(decisions[0].target, Tier::HostPinned);
+    FT_ASSERT_EQ(decisions[1].target, Tier::Nvme);
 }
 
 int main() { return ft_test::run_all("test_eviction"); }

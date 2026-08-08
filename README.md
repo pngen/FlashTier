@@ -10,8 +10,8 @@ real device-memory oversubscription: a logical working set exceeding both
 the configured device-memory and pinned-host budgets was forced across all
 three tiers — CUDA device memory, pinned system RAM, and NVMe — and exact
 integrity was preserved through tens of thousands of transfers, evictions,
-and writebacks. Other backends exist at different validation levels
-(compiled, compile-gated, or architecture-only) and are clearly labeled.
+and writebacks. The CPU backend is validated as an emulation path; other
+accelerator backends are either compile-gated or fail closed as noted below.
 
 **The central invariant:** when a working set exceeds physical accelerator
 memory, FlashTier replaces abrupt out-of-memory failure with explicit,
@@ -20,7 +20,7 @@ observable, policy-governed degradation.
 ## Hardware-validated proof
 
 The proof below was executed on the validation machine (RTX 5090, driver
-610.82, CUDA toolkit 12.9.86, build compiled for `sm_120` via native
+610.88, CUDA toolkit 12.9.86, build compiled for `sm_120` via native
 architecture detection) using the governed three-tier oversubscription
 test with 64 KiB pages:
 
@@ -105,7 +105,7 @@ untested GPU is described as validated.
           +----------------+----+--------+---------+------+
           |        |             |        |         |      |
        cuda     hip      level_zero   vulkan     metal    cpu
-   (validated) (gated)  (loader)   (experimental) (gated) (emulation)
+   (validated) (gated)  (disabled)   (disabled) (disabled) (emulation)
           +----------------+-------------+----------------+
           |                |             |
     Host backend      NVMe backend   Tier::Vram /
@@ -117,8 +117,8 @@ Governed tiers:
 
 - **accelerator-local device memory** — represented publicly by
   `Tier::Vram` for compatibility; the name is historical and now denotes
-  device memory across backend implementations (CUDA, HIP, Level Zero,
-  Vulkan, Metal);
+  device memory across backend implementations that satisfy the backend
+  contract;
 - **pinned host memory**;
 - **NVMe**.
 
@@ -137,9 +137,9 @@ vendor-neutral contract in
 |---|---|---|---|---|---|
 | cuda | NVIDIA | compiled | available | **validated** on RTX 5090 / sm_120 / Windows | conformance, transfer, oversubscription, integrity, and shutdown passed |
 | hip | AMD | source implemented, compile-gated | n/a (no ROCm toolchain locally) | not validated | written, not compiled locally |
-| level_zero | Intel | compiles via runtime loader (no SDK) | no loader/driver locally | not validated | compiled, not hardware-validated |
-| vulkan | cross-vendor | experimental, compiles via runtime loader (no SDK) | no loader/driver locally | not validated | experimental; storage buffers are not CUDA-compatible VRAM |
-| metal | Apple | Apple-gated architecture | n/a (Windows host) | not validated | not compiled or executed in this pass |
+| level_zero | Intel | containment stub | unavailable | not validated | fails closed; prior SDK-free ABI implementation was unsafe |
+| vulkan | cross-vendor | containment stub | unavailable | not validated | fails closed; no conforming host-memory contract is implemented |
+| metal | Apple | containment stub | unavailable | not validated | fails closed; no conforming raw-host-pointer contract is implemented |
 | cpu | portable | compiled | available | validated | contract conformance and CPU/RAM/NVMe runtime tests passed; no GPU execution claimed |
 
 The detailed authority is
@@ -155,8 +155,8 @@ validated.
 | Linux | supported source/build target | CPU and CUDA architecture present; no hardware validation recorded yet on this repository's validation machine |
 | NVIDIA CUDA | RTX 5090 / Blackwell sm_120 **validated** | other CUDA architectures are capability-driven and expected to build with appropriate architecture flags (`CMAKE_CUDA_ARCHITECTURES`); untested architectures remain unvalidated |
 | AMD | HIP backend implemented, compile-gated | no local toolchain or hardware validation |
-| Intel | Level Zero backend compiled via runtime-loader design | no local hardware validation |
-| Apple | Metal backend Apple-gated | no local compilation or validation in this Windows pass |
+| Intel | Level Zero backend fails closed | requires a specification-header-based implementation and hardware validation |
+| Apple | Metal backend fails closed | requires a conforming implementation and macOS hardware validation |
 
 CPU-only builds (`FLASHTIER_ENABLE_CUDA=OFF` or `--no-cuda`) build, test,
 and run the core runtime, planner, eviction, NVMe store, telemetry, and
@@ -181,9 +181,9 @@ CUDA (optional, for the CUDA backend):
 Other backends (all optional):
 
 - HIP: a ROCm/HIP toolchain (`FLASHTIER_ENABLE_HIP=ON`)
-- Level Zero: the Level Zero runtime loader and an Intel driver
-- Vulkan: a Vulkan loader and driver (experimental)
-- Metal: macOS with Xcode/Metal framework
+
+Level Zero, Vulkan, and Metal options currently build containment stubs that
+report `Unsupported`; they are not usable accelerator backends.
 
 Nothing beyond the core prerequisites is mandatory.
 
@@ -238,16 +238,15 @@ ctest --test-dir build/windows-cuda-release -C Release -V -L gpu --timeout 180
 
 Validated results (current suite):
 
-- CPU correctness: **13/13 tests passed, 0 failures** (state machine,
-  policy, eviction, NVMe store, telemetry, integrity, runtime cycles,
-  examples, and the generic backend-contract battery)
-- Generic backend contract: 18-point battery on the mock and CPU backends
-- CUDA real-hardware conformance: **5/5 checks** on the RTX 5090,
-  including the 18-point contract battery
+- CPU Release CTest: **17 passed, 1 intentionally skipped** (the CUDA
+  Unified Memory benchmark), 0 failures
+- Generic backend contract: mock and CPU backends passed
+- CUDA device-backend contract: **16/16 checks** on the RTX 5090
 - Tiny CUDA round trip: 16 MiB, zero mismatches
 - CUDA runtime oversubscription: three-tier residency with integrity
 - CUDA shutdown: repeated cycles, reopen, no tracked allocation leaks
-- GPU-labeled suite: **4/4 tests, 13 checks**
+- Final focused GPU regression: **4/4 tests passed**, including runtime,
+  oversubscription, shutdown, and Unified Memory comparison
 
 Test counts describe the current suite and will grow with the project.
 
@@ -303,7 +302,7 @@ capacity before any allocation (see [BENCHMARKS.md](BENCHMARKS.md)).
   Compound paths such as NVMe → host → CUDA device are staged sequences
   composed of recorded transfers.
 
-JSONL telemetry is validated against
+JSONL telemetry uses the format defined by
 [`schemas/telemetry.schema.json`](schemas/telemetry.schema.json) (schema
 version 1.0). All telemetry is local; nothing leaves the machine.
 
@@ -311,7 +310,9 @@ version 1.0). All telemetry is local; nothing leaves the machine.
 
 A bounded 512 MiB comparison benchmark measures FlashTier's explicit
 placement against CUDA Unified Memory (`cudaMallocManaged`) on the same
-machine, geometry, page size, and deterministic touch pattern:
+machine, working-set size, and page size. Each leg uses a deterministic
+verification workload, but their access operations are not identical, so
+the result is not presented as an apples-to-apples throughput comparison:
 
 - the driver-managed path completed with **zero mismatches**;
 - this WDDM driver rejects `cudaMemPrefetchAsync`/`cudaMemAdvise` at
@@ -333,8 +334,9 @@ Memory is not FlashTier's implementation mechanism.
 - Generic byte regions only; no tensor metadata adapter, real-model
   inference adapter, or framework integration (llama.cpp, PyTorch, vLLM
   research only, see [ROADMAP.md](ROADMAP.md)).
-- No hardware validation yet for AMD, Intel, Vulkan, Metal, Linux CUDA,
-  or NVIDIA architectures other than sm_120 on the RTX 5090.
+- No hardware validation yet for AMD or Linux CUDA, or for NVIDIA
+  architectures other than sm_120 on the RTX 5090. Level Zero, Vulkan, and
+  Metal intentionally fail closed pending conforming implementations.
 - Windows WDDM imposes implicit synchronization and disallows
   `concurrentManagedAccess` on many systems; the runtime uses explicit
   copies and reports capabilities truthfully.

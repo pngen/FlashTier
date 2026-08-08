@@ -1,11 +1,27 @@
 #include "flashtier/allocator.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
+
+#include "flashtier/error.hpp"
 
 namespace flashtier {
 
 void TierBudget::set_limit(uint64_t limit_bytes, double reserve_margin) {
+    if (!std::isfinite(reserve_margin) || reserve_margin < 0.0 ||
+        reserve_margin >= 1.0) {
+        throw Error(ErrorCode::InvalidArgument,
+                    "tier reserve margin must be finite and in [0, 1)");
+    }
     std::lock_guard lock(mu_);
+    const uint64_t reserve = static_cast<uint64_t>(
+        static_cast<double>(limit_bytes) * reserve_margin);
+    const uint64_t usable = limit_bytes - reserve;
+    if (used_ > usable) {
+        throw Error(ErrorCode::Budget,
+                    "new tier limit is below current reserved usage");
+    }
     limit_ = limit_bytes;
     margin_ = reserve_margin;
 }
@@ -31,11 +47,20 @@ bool TierBudget::try_reserve(uint64_t bytes) {
 
 void TierBudget::release(uint64_t bytes) {
     std::lock_guard lock(mu_);
-    used_ = (bytes >= used_) ? 0 : used_ - bytes;
+    if (bytes > used_) {
+        throw Error(ErrorCode::Invariant,
+                    "tier budget release exceeds reserved usage",
+                    "release " + std::to_string(bytes) +
+                        " used " + std::to_string(used_));
+    }
+    used_ -= bytes;
 }
 
 void TierBudget::force_reserve(uint64_t bytes) {
     std::lock_guard lock(mu_);
+    if (bytes > std::numeric_limits<uint64_t>::max() - used_) {
+        throw Error(ErrorCode::Budget, "tier budget accounting overflow");
+    }
     used_ += bytes;
     high_water_ = std::max(high_water_, used_);
 }

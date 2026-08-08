@@ -75,6 +75,9 @@ public:
                              DeviceStream* stream);
 
 private:
+    DeviceCapabilities probe_capabilities_for_device(int device_index) const;
+    void close_locked();
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -95,39 +98,58 @@ public:
     }
     void close() override {}
     bool is_open() const override { return false; }
-    DeviceInfo device_info() const override { return {}; }
-    DeviceCapabilities capabilities() const override { return {}; }
+    DeviceInfo device_info() const override { unavailable(); }
+    DeviceCapabilities capabilities() const override { unavailable(); }
     uint64_t total_memory() const override { return 0; }
     uint64_t free_memory() const override { return 0; }
-    void* allocate(std::size_t) override { return nullptr; }
-    void free(void*) override {}
-    void* allocate_host_pinned(std::size_t) override { return nullptr; }
-    void free_host_pinned(void*) override {}
-    void* allocate_unified(std::size_t) override {
-        throw Error(ErrorCode::Unsupported, "cuda backend not compiled");
+    void* allocate(std::size_t) override { unavailable(); }
+    void free(void* ptr) override {
+        if (ptr != nullptr) unavailable();
     }
-    void free_unified(void*) override {}
-    void prefetch_to_device(void*, std::size_t) override {
-        throw Error(ErrorCode::Unsupported, "cuda backend not compiled");
+    void* allocate_host_pinned(std::size_t) override { unavailable(); }
+    void free_host_pinned(void* ptr) override {
+        if (ptr != nullptr) unavailable();
     }
-    void advise_preferred_location(void*, std::size_t) override {
-        throw Error(ErrorCode::Unsupported, "cuda backend not compiled");
+    void* allocate_unified(std::size_t) override { unavailable(); }
+    void free_unified(void* ptr) override {
+        if (ptr != nullptr) unavailable();
     }
-    DeviceStream* create_stream() override { return nullptr; }
-    void destroy_stream(DeviceStream*) override {}
-    DeviceEvent* create_event() override { return nullptr; }
-    void destroy_event(DeviceEvent*) override {}
-    void async_copy_host_to_device(void*, const void*, std::size_t, DeviceStream*) override {}
-    void async_copy_device_to_host(void*, const void*, std::size_t, DeviceStream*) override {}
-    void async_copy_device_to_device(void*, const void*, std::size_t, DeviceStream*) override {}
-    void sync_stream(DeviceStream*) override {}
-    void sync_all() override {}
-    void record_event(DeviceEvent*, DeviceStream*) override {}
-    void wait_event(DeviceEvent*) override {}
-    double event_elapsed_us(DeviceEvent*, DeviceEvent*) override { return 0.0; }
+    void prefetch_to_device(void*, std::size_t) override { unavailable(); }
+    void advise_preferred_location(void*, std::size_t) override { unavailable(); }
+    DeviceStream* create_stream() override { unavailable(); }
+    void destroy_stream(DeviceStream* stream) override {
+        if (stream != nullptr) unavailable();
+    }
+    DeviceEvent* create_event() override { unavailable(); }
+    void destroy_event(DeviceEvent* event) override {
+        if (event != nullptr) unavailable();
+    }
+    void async_copy_host_to_device(void*, const void*, std::size_t,
+                                   DeviceStream*) override {
+        unavailable();
+    }
+    void async_copy_device_to_host(void*, const void*, std::size_t,
+                                   DeviceStream*) override {
+        unavailable();
+    }
+    void async_copy_device_to_device(void*, const void*, std::size_t,
+                                     DeviceStream*) override {
+        unavailable();
+    }
+    void sync_stream(DeviceStream*) override { unavailable(); }
+    void sync_all() override { unavailable(); }
+    void record_event(DeviceEvent*, DeviceStream*) override { unavailable(); }
+    void wait_event(DeviceEvent*) override { unavailable(); }
+    double event_elapsed_us(DeviceEvent*, DeviceEvent*) override { unavailable(); }
     bool healthy() const override { return false; }
     std::string diagnostics() const override { return "cuda backend not compiled"; }
     std::string last_error() const override { return ""; }
+
+private:
+    [[noreturn]] static void unavailable() {
+        throw Error(ErrorCode::Unsupported,
+                    "cuda backend not compiled into this build");
+    }
 };
 
 #endif  // FLASHTIER_HAVE_CUDA

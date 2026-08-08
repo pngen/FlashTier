@@ -8,14 +8,9 @@
 
 namespace flashtier {
 
-// Intel GPU backend through the Level Zero loader.
-//
-// The Level Zero API surface is self-declared (matching the Level Zero 1.x
-// specification) and the loader DLL/SO is resolved at runtime, so this
-// module compiles on any platform without the Intel SDK and probes
-// availability at runtime. Nothing is claimed for Intel hardware that was
-// not executed here; local validation of this backend requires an Intel
-// GPU plus a Level Zero loader/driver.
+// Fail-closed placeholder for the Intel Level Zero backend. The backend stays
+// registered for configuration compatibility, but reports unavailable and
+// never calls a loader until an ABI-safe implementation is validated.
 class LevelZeroBackend final : public DeviceBackend {
 public:
     LevelZeroBackend();

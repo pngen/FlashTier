@@ -1,8 +1,16 @@
 #include "test_harness.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
+#include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "flashtier/telemetry.hpp"
 
@@ -25,6 +33,17 @@ TelemetryEvent sample_event() {
     ev.vram_used = 100;
     ev.cache_hit = false;
     return ev;
+}
+
+std::string telemetry_test_path(const char* leaf) {
+#if defined(_WIN32)
+    const int pid = _getpid();
+#else
+    const int pid = static_cast<int>(::getpid());
+#endif
+    return (std::filesystem::temp_directory_path() /
+            (std::string("ft-test-telemetry-") + std::to_string(pid) + "-" + leaf))
+        .string();
 }
 
 }  // namespace
@@ -54,10 +73,18 @@ FT_TEST(jsonl_escapes_strings) {
     FT_ASSERT(line.find("\\\"quoted\\\"") != std::string::npos);
 }
 
+FT_TEST(jsonl_serializes_signed_fields_without_unsigned_wraparound) {
+    TelemetryEvent ev;
+    ev.type = EventType::PageAlloc;
+    ev.logical_size = -1;
+    const std::string line = telemetry_event_to_jsonl(ev);
+    FT_ASSERT(line.find("\"logical_size\":-1") != std::string::npos);
+    FT_ASSERT(line.find("18446744073709551615") == std::string::npos);
+}
+
 FT_TEST(sink_writes_human_and_jsonl_files) {
-    const std::string dir = std::filesystem::temp_directory_path().string();
-    const std::string human = dir + "/ft-test-telemetry-human.txt";
-    const std::string jsonl = dir + "/ft-test-telemetry.jsonl";
+    const std::string human = telemetry_test_path("human.txt");
+    const std::string jsonl = telemetry_test_path("events.jsonl");
     {
         TelemetrySink sink(human, jsonl, false);
         sink.emit(sample_event());
@@ -81,6 +108,38 @@ FT_TEST(sink_assigns_monotonic_sequences) {
     FT_ASSERT_EQ(s1, 1u);
     FT_ASSERT_EQ(s2, 2u);
     FT_ASSERT_EQ(sink.events_emitted(), 2u);
+}
+
+FT_TEST(sink_event_count_is_safe_during_concurrent_emission) {
+    TelemetrySink sink("", "", false);
+    constexpr uint64_t kEvents = 20000;
+    std::atomic<bool> done{false};
+    std::atomic<bool> monotonic{true};
+
+    std::thread reader([&] {
+        uint64_t previous = 0;
+        while (!done.load(std::memory_order_acquire)) {
+            const uint64_t current = sink.events_emitted();
+            if (current < previous || current > kEvents) {
+                monotonic.store(false, std::memory_order_relaxed);
+            }
+            previous = current;
+        }
+    });
+    std::thread writer([&] {
+        for (uint64_t i = 0; i < kEvents; ++i) {
+            TelemetryEvent ev;
+            ev.type = EventType::PageAlloc;
+            ev.page_id = i + 1;
+            sink.emit(std::move(ev));
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    writer.join();
+    reader.join();
+    FT_ASSERT(monotonic.load(std::memory_order_relaxed));
+    FT_ASSERT_EQ(sink.events_emitted(), kEvents);
 }
 
 FT_TEST(aggregator_computes_hit_rates_and_path_stats) {
@@ -163,6 +222,42 @@ FT_TEST(aggregator_prefetch_accounting) {
     FT_ASSERT_EQ(s.prefetch_hits, 1u);
     FT_ASSERT_EQ(s.prefetch_waste, 1u);
     FT_ASSERT_EQ(s.prefetch_hit_rate(), 1.0);
+}
+
+FT_TEST(aggregator_distinguishes_clean_drops_from_writebacks) {
+    TelemetryAggregator agg;
+    TelemetryEvent clean;
+    clean.type = EventType::Evict;
+    clean.dst = Tier::Nvme;
+    clean.reason = "drop_clean";
+    agg.record(clean);
+
+    TelemetryEvent dirty = clean;
+    dirty.reason = "writeback";
+    agg.record(dirty);
+
+    const auto summary = agg.summary();
+    FT_ASSERT_EQ(summary.evictions, 2u);
+    FT_ASSERT_EQ(summary.writebacks, 1u);
+}
+
+FT_TEST(aggregator_tracks_residency_peaks_on_transfer_events) {
+    TelemetryAggregator agg;
+    TelemetryEvent transfer;
+    transfer.type = EventType::TransferEnd;
+    transfer.src = Tier::HostPinned;
+    transfer.dst = Tier::Vram;
+    transfer.bytes = 4096;
+    transfer.duration_us = 10.0;
+    transfer.vram_used = 8192;
+    transfer.host_used = 4096;
+    transfer.nvme_used = 16384;
+    agg.record(transfer);
+
+    const auto summary = agg.summary();
+    FT_ASSERT_EQ(summary.max_vram_resident, 8192u);
+    FT_ASSERT_EQ(summary.max_host_resident, 4096u);
+    FT_ASSERT_EQ(summary.max_nvme_resident, 16384u);
 }
 
 int main() { return ft_test::run_all("test_telemetry"); }

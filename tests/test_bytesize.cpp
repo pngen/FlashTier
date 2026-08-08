@@ -12,8 +12,10 @@ FT_TEST(bytesize_parses_binary_suffixes) {
     FT_ASSERT_EQ(parse_bytesize("4TiB"), 4ull * 1024 * 1024 * 1024 * 1024);
     FT_ASSERT_EQ(parse_bytesize("4096"), 4096ull);
     FT_ASSERT_EQ(parse_bytesize("16 KiB"), 16ull * 1024);
+    FT_ASSERT_EQ(parse_bytesize("16 KiB  "), 16ull * 1024);
     FT_ASSERT_EQ(parse_bytesize("1kib"), 1024ull);
     FT_ASSERT_EQ(parse_bytesize("0"), 0ull);
+    FT_ASSERT_EQ(parse_bytesize("18446744073709551615"), UINT64_MAX);
 }
 
 FT_TEST(bytesize_rejects_malformed) {

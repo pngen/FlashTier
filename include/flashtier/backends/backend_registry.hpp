@@ -42,8 +42,9 @@ public:
 
     // Automatic selection: prefer the first compiled backend with a
     // functioning discrete GPU device, then any other accelerator device,
-    // then CPU-only. Returns the chosen backend name and sets `reason` to
-    // explain the choice (including CPU-only fallback).
+    // then CPU-only when that backend was compiled. Returns the chosen backend
+    // name and sets `reason` to explain the choice (including CPU-only
+    // fallback); throws Unsupported when no usable backend exists.
     std::string select_automatic(std::string& reason_out) const;
 
 private:
@@ -53,7 +54,9 @@ private:
 
 // Called by BackendRegistry::instance() on first use. Each backend module
 // defines one of these (compiled only when its build option is enabled).
+#if FLASHTIER_HAVE_CPU_BACKEND
 void register_cpu_backend(BackendRegistry& registry);
+#endif
 #if FLASHTIER_HAVE_CUDA
 void register_cuda_backend(BackendRegistry& registry);
 #endif

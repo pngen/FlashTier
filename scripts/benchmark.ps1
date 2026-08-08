@@ -14,14 +14,15 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $buildDir = Join-Path $PSScriptRoot "..\build\$Preset"
-$exe = Join-Path $buildDir "bin\flashtier.exe"
-if (-not (Test-Path $exe)) {
-    $alt = Join-Path $buildDir "flashtier.exe"
-    if (-not (Test-Path $alt)) {
-        Write-Error "flashtier executable not found under '$buildDir'. Run build.ps1 first."
-        exit 2
-    }
-    $exe = $alt
+$candidates = @(
+    (Join-Path $buildDir "bin\flashtier.exe"),
+    (Join-Path $buildDir "$Config\flashtier.exe"),
+    (Join-Path $buildDir "flashtier.exe")
+)
+$exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $exe) {
+    Write-Error "flashtier executable not found under '$buildDir' for configuration '$Config'. Run build.ps1 first."
+    exit 2
 }
 
 function Invoke-Flashtier([string[]]$Args, [string]$Label) {

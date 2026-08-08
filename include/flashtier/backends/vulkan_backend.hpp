@@ -8,21 +8,9 @@
 
 namespace flashtier {
 
-// EXPERIMENTAL cross-vendor Vulkan compute backend.
-//
-// Purpose: broader accelerator fallback coverage on GPUs without a native
-// compute backend (CUDA/HIP/Level Zero). Uses storage buffers and transfer
-// queues; memory heaps are classified from discovery (device-local vs
-// host-visible). Vulkan storage buffers are NOT CUDA-compatible VRAM and
-// are never described as such.
-//
-// The Vulkan API surface is self-declared (core 1.x specification) and
-// resolved at runtime from the loader (vulkan-1.dll / libvulkan.so), so
-// this module compiles without the Vulkan SDK and stays disabled when no
-// loader/driver exists.
-//
-// Local validation status: experimental; not runtime-validated in this
-// environment unless a Vulkan-capable GPU and loader were present.
+// Fail-closed placeholder for the cross-vendor Vulkan backend. The backend
+// stays registered for configuration compatibility, but reports unavailable
+// and never calls a loader until an ABI-safe implementation is validated.
 class VulkanBackend final : public DeviceBackend {
 public:
     VulkanBackend();

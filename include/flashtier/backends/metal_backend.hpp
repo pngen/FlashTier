@@ -8,17 +8,9 @@
 
 namespace flashtier {
 
-// Apple Metal backend (macOS only).
-//
-// Uses Metal buffers, command queues, and blit command encoders for
-// host<->device transfers. Apple Silicon is unified memory: device buffers
-// share system RAM, so memory_shared is reported from discovery and the
-// governed runtime's integrated-GPU accounting applies (no double counting
-// of the same physical RAM as separate device and host capacity).
-//
-// Compile-gated to Apple platforms (requires Metal.framework). This module
-// was written and architecture-checked on a Windows host; macOS hardware
-// execution was NOT locally validated in this pass and is not claimed.
+// Fail-closed placeholder for the Apple Metal backend (macOS only). The
+// backend stays registered for configuration compatibility, but reports
+// unavailable until its host-pointer semantics pass real-hardware conformance.
 class MetalBackend final : public DeviceBackend {
 public:
     MetalBackend();

@@ -15,6 +15,8 @@ public:
     // reserves nothing) when the request would breach the reserve margin.
     bool try_reserve(uint64_t bytes);
 
+    // Release a prior reservation. Over-release is an invariant violation,
+    // not a reason to silently reset accounting.
     void release(uint64_t bytes);
     void force_reserve(uint64_t bytes);  // used for staging buffers that the
                                          // caller accounts for separately

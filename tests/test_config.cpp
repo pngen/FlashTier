@@ -1,5 +1,8 @@
 #include "test_harness.hpp"
 
+#include <limits>
+
+#include "flashtier/cli.hpp"
 #include "flashtier/config.hpp"
 
 using namespace flashtier;
@@ -46,6 +49,64 @@ FT_TEST(budget_fraction_validation) {
     FT_ASSERT(validate_config(cfg).ok);
     cfg.vram_reserve_margin = 0.6;
     FT_ASSERT(!validate_config(cfg).ok);
+}
+
+FT_TEST(nonfinite_fractions_are_rejected) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    Config cfg;
+    cfg.auto_vram_fraction = nan;
+    FT_ASSERT(!validate_config(cfg).ok);
+    cfg = Config{};
+    cfg.auto_host_fraction = nan;
+    FT_ASSERT(!validate_config(cfg).ok);
+    cfg = Config{};
+    cfg.auto_nvme_fraction = nan;
+    FT_ASSERT(!validate_config(cfg).ok);
+    cfg = Config{};
+    cfg.vram_reserve_margin = nan;
+    FT_ASSERT(!validate_config(cfg).ok);
+}
+
+FT_TEST(direct_config_bounds_and_enums_are_rejected) {
+    Config cfg;
+    cfg.queue_depth = 1025;
+    FT_ASSERT(!validate_config(cfg).ok);
+    cfg = Config{};
+    cfg.worker_threads = 1025;
+    FT_ASSERT(!validate_config(cfg).ok);
+    cfg = Config{};
+    cfg.prefetch_depth = (1u << 20) + 1;
+    FT_ASSERT(!validate_config(cfg).ok);
+    cfg = Config{};
+    cfg.iterations = 1000001;
+    FT_ASSERT(!validate_config(cfg).ok);
+    cfg = Config{};
+    cfg.auto_nvme_cap = cfg.page_size + 1;
+    FT_ASSERT(!validate_config(cfg).ok);
+    cfg = Config{};
+    cfg.policy = static_cast<PolicyKind>(99);
+    FT_ASSERT(!validate_config(cfg).ok);
+    cfg = Config{};
+    cfg.prefetch = static_cast<PrefetchKind>(99);
+    FT_ASSERT(!validate_config(cfg).ok);
+}
+
+FT_TEST(cli_rejects_nonfinite_partial_and_truncating_numbers) {
+    auto parse_value = [](const char* option, const char* value) {
+        char program[] = "flashtier";
+        char option_buf[64] = {};
+        char value_buf[64] = {};
+        std::snprintf(option_buf, sizeof(option_buf), "%s", option);
+        std::snprintf(value_buf, sizeof(value_buf), "%s", value);
+        char* argv[] = {program, option_buf, value_buf};
+        return cli::parse_args(3, argv);
+    };
+
+    FT_ASSERT(!parse_value("--auto-vram-fraction", "nan").errors.empty());
+    FT_ASSERT(!parse_value("--auto-vram-fraction", "0.5junk").errors.empty());
+    FT_ASSERT(parse_value("--auto-vram-fraction", "0.5").errors.empty());
+    FT_ASSERT(!parse_value("--um-prefetch-pages", "4294967296").errors.empty());
+    FT_ASSERT(parse_value("--um-prefetch-pages", "4294967295").errors.empty());
 }
 
 FT_TEST(policy_name_roundtrip) {

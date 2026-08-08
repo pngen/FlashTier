@@ -14,9 +14,9 @@ include(FlashTierWarnings)
 # ---------------------------------------------------------------------------
 option(FLASHTIER_ENABLE_CUDA           "Build with NVIDIA CUDA support" ON)
 option(FLASHTIER_ENABLE_HIP            "Build with AMD HIP/ROCm support (requires HIP toolchain)" OFF)
-option(FLASHTIER_ENABLE_LEVEL_ZERO     "Build with Intel Level Zero support (runtime loader probe)" ON)
-option(FLASHTIER_ENABLE_VULKAN         "Build with experimental Vulkan backend (runtime loader probe)" ON)
-option(FLASHTIER_ENABLE_METAL          "Build with Apple Metal backend (macOS only)" ON)
+option(FLASHTIER_ENABLE_LEVEL_ZERO     "Build the fail-closed Intel Level Zero containment stub" ON)
+option(FLASHTIER_ENABLE_VULKAN         "Build the fail-closed Vulkan containment stub" ON)
+option(FLASHTIER_ENABLE_METAL          "Build the fail-closed Apple Metal containment stub (macOS only)" ON)
 option(FLASHTIER_ENABLE_CPU_BACKEND    "Build the CPU emulation backend" ON)
 option(FLASHTIER_ENABLE_DIRECTSTORAGE  "Probe Windows DirectStorage (experimental capability probe only; never required)" OFF)
 option(FLASHTIER_ENABLE_GDS            "Enable GPUDirect Storage backend where available (Linux-first; never required)" OFF)
@@ -39,7 +39,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse --short=12 HEAD
     OUTPUT_VARIABLE FLASHTIER_GIT_REVISION
     OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE FLASHTIER_GIT_RESULT
     ERROR_QUIET)
+  if(NOT FLASHTIER_GIT_RESULT EQUAL 0 OR FLASHTIER_GIT_REVISION STREQUAL "")
+    set(FLASHTIER_GIT_REVISION "unknown")
+  endif()
 endif()
 set(FLASHTIER_GIT_REVISION "${FLASHTIER_GIT_REVISION}" CACHE STRING "Git revision baked into the build (set manually in archives)")
 
@@ -90,7 +94,9 @@ if(FLASHTIER_ENABLE_HIP)
   message(STATUS "FlashTier: HIP toolchain ${HIP_VERSION}")
 endif()
 
-# Level Zero / Vulkan use runtime loader probes (no SDK required).
+# These options retain registry/API compatibility while their implementations
+# fail closed. They must not become available until conforming backends pass
+# their hardware proof sequences.
 set(FLASHTIER_HAVE_LEVEL_ZERO ${FLASHTIER_ENABLE_LEVEL_ZERO})
 set(FLASHTIER_HAVE_VULKAN ${FLASHTIER_ENABLE_VULKAN})
 if(APPLE)
@@ -143,6 +149,7 @@ if(FLASHTIER_HAVE_HIP)
 endif()
 
 add_library(flashtier_core STATIC ${FLASHTIER_CORE_SOURCES})
+flashtier_apply_warnings(flashtier_core)
 
 target_include_directories(flashtier_core PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
@@ -171,15 +178,7 @@ if(FLASHTIER_HAVE_HIP)
   target_link_libraries(flashtier_core PUBLIC hip::host)
 endif()
 
-target_link_libraries(flashtier_core PUBLIC Threads::Threads)
-
-if(FLASHTIER_WARNINGS_AS_ERRORS)
-  if(MSVC)
-    target_compile_options(flashtier_core PRIVATE /WX)
-  else()
-    target_compile_options(flashtier_core PRIVATE -Werror)
-  endif()
-endif()
+target_link_libraries(flashtier_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 # ---------------------------------------------------------------------------
 # CUDA-only library (vendor backend implementation)
@@ -213,6 +212,7 @@ endif()
 # CLI
 # ---------------------------------------------------------------------------
 add_executable(flashtier src/cli/main.cpp)
+flashtier_apply_warnings(flashtier)
 target_compile_definitions(flashtier PRIVATE
   FLASHTIER_VERSION="${PROJECT_VERSION}"
   FLASHTIER_GIT_REVISION="${FLASHTIER_GIT_REVISION}")
@@ -224,14 +224,6 @@ if(FLASHTIER_BUILD_BENCHMARKS)
   target_link_libraries(flashtier PRIVATE flashtier_benchlib)
 else()
   target_sources(flashtier PRIVATE src/benchmark_stub.cpp)
-endif()
-
-if(FLASHTIER_WARNINGS_AS_ERRORS)
-  if(MSVC)
-    target_compile_options(flashtier PRIVATE /WX)
-  else()
-    target_compile_options(flashtier PRIVATE -Werror)
-  endif()
 endif()
 
 # ---------------------------------------------------------------------------

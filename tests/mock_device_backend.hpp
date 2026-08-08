@@ -167,8 +167,24 @@ public:
     void prefetch_to_device(void*, std::size_t) override {}
     void advise_preferred_location(void*, std::size_t) override {}
 
-    DeviceStream* create_stream() override { return new MockStream(); }
-    void destroy_stream(DeviceStream* s) override { delete s; }
+    DeviceStream* create_stream() override {
+        auto* stream = new MockStream();
+        std::lock_guard lock(mu_);
+        ++active_streams_;
+        return stream;
+    }
+    void destroy_stream(DeviceStream* s) override {
+        if (s == nullptr) return;
+        {
+            std::lock_guard lock(mu_);
+            if (active_streams_ == 0) {
+                throw Error(ErrorCode::State,
+                            "mock: destroy_stream without an active stream");
+            }
+            --active_streams_;
+        }
+        delete s;
+    }
     DeviceEvent* create_event() override { return new MockEvent(); }
     void destroy_event(DeviceEvent* e) override { delete e; }
 
@@ -221,6 +237,11 @@ public:
         return used_bytes_;
     }
 
+    std::size_t active_streams() const {
+        std::lock_guard lock(mu_);
+        return active_streams_;
+    }
+
 private:
     class MockStream final : public DeviceStream {};
     class MockEvent final : public DeviceEvent {
@@ -239,6 +260,7 @@ private:
     DeviceInfo info_;
     bool opened_ = false;
     uint64_t used_bytes_ = 0;
+    std::size_t active_streams_ = 0;
     std::unordered_map<void*, std::pair<std::vector<uint8_t>*, uint64_t>> blocks_;
     std::string last_error_;
 };

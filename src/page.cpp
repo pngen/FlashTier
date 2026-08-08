@@ -86,6 +86,12 @@ void PageMetadata::transition(PageState to) {
                         std::string(page_state_name(to)),
                     "page " + id.to_string());
     }
+    if (state == PageState::ResidentVram && to == PageState::ResidentNvme &&
+        (dirty || !has_nvme_copy || nvme_offset == kInvalidOffset)) {
+        throw Error(ErrorCode::Invariant,
+                    "cannot drop device-resident page without a valid clean NVMe copy",
+                    "page " + id.to_string());
+    }
     state = to;
     switch (to) {
         case PageState::ResidentVram: current_tier = Tier::Vram; break;

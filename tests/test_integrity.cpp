@@ -1,8 +1,10 @@
 #include "test_harness.hpp"
 
 #include <cstring>
+#include <limits>
 #include <vector>
 
+#include "flashtier/error.hpp"
 #include "flashtier/integrity.hpp"
 #include "flashtier/workload.hpp"
 
@@ -54,6 +56,24 @@ FT_TEST(fill_pattern_deterministic_across_calls) {
     FT_ASSERT(std::memcmp(a.data(), b.data(), a.size()) == 0);
 }
 
+FT_TEST(fill_pattern_has_platform_independent_byte_order) {
+    std::vector<uint8_t> buf(8);
+    fill_pattern(buf.data(), buf.size(), 42, 7);
+    const uint8_t expected[] = {0x89, 0xA8, 0x73, 0xDE,
+                                0xC7, 0x05, 0xBD, 0xCB};
+    FT_ASSERT(std::memcmp(buf.data(), expected, sizeof(expected)) == 0);
+}
+
+FT_TEST(verify_pattern_check_limit_is_an_exact_prefix) {
+    std::vector<uint8_t> bytes(128);
+    fill_pattern(bytes.data(), bytes.size(), 3, 4);
+    bytes[100] ^= 0x01;
+    FT_ASSERT(!verify_pattern(bytes.data(), bytes.size(), 3, 4, 100).has_value());
+    const auto mismatch = verify_pattern(bytes.data(), bytes.size(), 3, 4, 101);
+    FT_ASSERT(mismatch.has_value());
+    FT_ASSERT_EQ(mismatch->offset, 100u);
+}
+
 FT_TEST(trace_generators_are_deterministic) {
     TraceGenerator g1(12345, 64, 1000, TracePattern::Skewed, 1.1);
     TraceGenerator g2(12345, 64, 1000, TracePattern::Skewed, 1.1);
@@ -71,6 +91,28 @@ FT_TEST(trace_generators_respect_page_count) {
             FT_ASSERT(a.page_id < 16);
         }
     }
+}
+
+FT_TEST(single_page_moe_trace_does_not_divide_by_zero) {
+    TraceGenerator g(1, 1, 500, TracePattern::MoE, 1.0);
+    FT_ASSERT_EQ(g.accesses().size(), 500u);
+    for (const auto& a : g.accesses()) FT_ASSERT_EQ(a.page_id, 0u);
+}
+
+FT_TEST(trace_generators_reject_malformed_geometry) {
+    FT_ASSERT_THROWS(TraceGenerator(1, 0, 1, TracePattern::Sequential),
+                     ErrorCode::InvalidArgument);
+    FT_ASSERT_THROWS(TraceGenerator(1, 4, 1, static_cast<TracePattern>(99)),
+                     ErrorCode::InvalidArgument);
+    FT_ASSERT_THROWS(ZipfGenerator(1, 0, 1.0), ErrorCode::InvalidArgument);
+    FT_ASSERT_THROWS(ZipfGenerator(1, 4, std::numeric_limits<double>::infinity()),
+                     ErrorCode::InvalidArgument);
+    FT_ASSERT_THROWS(generate_moe_trace(1, 4, 5, 0, 1, 1.0, 1),
+                     ErrorCode::InvalidArgument);
+    FT_ASSERT_THROWS(generate_moe_trace(1, 4, 0, 0, 1, 1.0, 1),
+                     ErrorCode::InvalidArgument);
+    FT_ASSERT_THROWS(generate_moe_trace(1, 4, 1, 5, 1, 1.0, 1),
+                     ErrorCode::InvalidArgument);
 }
 
 FT_TEST(splitmix64_deterministic_sequence) {
@@ -94,8 +136,13 @@ FT_TEST(moe_trace_shapes) {
     }
     const auto annotated = annotate_next_use(trace);
     FT_ASSERT_EQ(annotated.size(), trace.size());
-    for (const auto& a : annotated) {
-        FT_ASSERT(a.page_id == a.page_id);  // no NaN concern; structural check
+    for (std::size_t i = 0; i < annotated.size(); ++i) {
+        FT_ASSERT_EQ(annotated[i].page_id, trace[i]);
+        if (annotated[i].next_use_distance != 0) {
+            const std::size_t next = i + annotated[i].next_use_distance;
+            FT_ASSERT(next < trace.size());
+            FT_ASSERT_EQ(trace[next], trace[i]);
+        }
     }
 }
 

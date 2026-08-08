@@ -5,6 +5,8 @@
 #include <limits>
 #include <memory>
 
+#include "flashtier/error.hpp"
+
 namespace flashtier {
 
 // ---------------------------------------------------------------------------
@@ -94,12 +96,13 @@ double PredictivePolicy::transfer_cost(Tier from, uint64_t bytes) const {
 double PredictivePolicy::score(const PageMetadata& page) const {
     // Heuristic temperature score. Higher = keep in VRAM / promote first.
     // Terms (documented heuristic, not optimal):
-    //   recency  : 1 / (1 + log2(1 + last_access_sequence_delta))
+    //   recency  : monotonic, bounded weight derived from the global access
+    //              sequence (larger sequence = more recently accessed)
     //   frequency: min(1, access_count / 8)
     //   reuse    : next-use hint proximity (execution_order_hint)
     //   class    : semantic_class_weight
     //   pin      : pinned pages are worth +2
-    //   dirty    : dirty pages cost a writeback when evicted (-1)
+    //   dirty    : dirty pages cost a writeback when evicted (+1 to keep)
     //   cost     : transfer cost of loading from the current tier (-)
     double score = 0.0;
 
@@ -110,8 +113,11 @@ double PredictivePolicy::score(const PageMetadata& page) const {
         score += 0.2;  // never touched: cold
     }
 
-    const double recency = 1.0 / (1.0 + std::log2(1.0 + static_cast<double>(page.last_access_sequence)));
-    score += 1.0 * recency;
+    if (page.last_access_sequence > 0) {
+        const double age_rank =
+            std::log2(1.0 + static_cast<double>(page.last_access_sequence));
+        score += age_rank / (1.0 + age_rank);
+    }
 
     if (page.reuse_distance_estimate >= 0) {
         score += 1.0 / (1.0 + static_cast<double>(page.reuse_distance_estimate));
@@ -123,7 +129,7 @@ double PredictivePolicy::score(const PageMetadata& page) const {
     score *= class_weight(page.semantic_class);
 
     if (page.pinned) score += 2.0;
-    if (page.dirty) score -= 1.0;
+    if (page.dirty) score += 1.0;
 
     score -= transfer_cost(page.current_tier, page.allocation_size);
 
@@ -165,7 +171,7 @@ std::unique_ptr<Policy> make_policy(PolicyKind kind) {
         case PolicyKind::Lru: return std::make_unique<LruPolicy>();
         case PolicyKind::Predictive: return std::make_unique<PredictivePolicy>();
     }
-    return std::make_unique<PredictivePolicy>();
+    throw Error(ErrorCode::InvalidArgument, "unknown placement policy");
 }
 
 }  // namespace flashtier

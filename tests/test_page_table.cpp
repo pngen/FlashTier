@@ -45,11 +45,31 @@ FT_TEST(illegal_transitions_are_rejected) {
     FT_ASSERT_THROWS(p.transition(PageState::LoadingToVram), ErrorCode::State);
     // ResidentVram -> ResidentNvme is the legal clean drop (valid NVMe copy,
     // no transfer); the next transition from ResidentNvme must be a load.
+    p.dirty = false;
+    p.has_nvme_copy = true;
+    p.nvme_offset = 4096;
     p.transition(PageState::ResidentNvme);
     FT_ASSERT_THROWS(p.transition(PageState::ResidentVram), ErrorCode::State);    // no direct hop
     p.transition(PageState::Released);
     FT_ASSERT_THROWS(p.transition(PageState::Unallocated), ErrorCode::State);     // terminal
     FT_ASSERT_THROWS(p.transition(PageState::Released), ErrorCode::State);
+}
+
+FT_TEST(clean_drop_requires_a_valid_nvme_copy) {
+    PageMetadata p;
+    p.id = PageId{3};
+    p.transition(PageState::ResidentVram);
+
+    FT_ASSERT_THROWS(p.transition(PageState::ResidentNvme), ErrorCode::Invariant);
+    FT_ASSERT_EQ(p.state, PageState::ResidentVram);
+
+    p.has_nvme_copy = true;
+    FT_ASSERT_THROWS(p.transition(PageState::ResidentNvme), ErrorCode::Invariant);
+    p.nvme_offset = 4096;
+    p.dirty = true;
+    FT_ASSERT_THROWS(p.transition(PageState::ResidentNvme), ErrorCode::Invariant);
+    p.dirty = false;
+    p.transition(PageState::ResidentNvme);
 }
 
 FT_TEST(transition_table_is_symmetric_with_spec) {
@@ -93,6 +113,21 @@ FT_TEST(page_table_insert_lookup_erase) {
     FT_ASSERT(!t.contains(PageId{7}));
     FT_ASSERT_THROWS(t.copy_of(PageId{7}), ErrorCode::NotFound);
     FT_ASSERT_THROWS(t.with(PageId{7}, [](PageMetadata&){}), ErrorCode::NotFound);
+}
+
+FT_TEST(page_table_rejects_duplicate_ids_without_overwriting) {
+    PageTable t;
+    PageMetadata original;
+    original.id = PageId{11};
+    original.logical_size = 123;
+    t.insert(original);
+
+    PageMetadata duplicate;
+    duplicate.id = original.id;
+    duplicate.logical_size = 999;
+    FT_ASSERT_THROWS(t.insert(duplicate), ErrorCode::Invariant);
+    FT_ASSERT_EQ(t.size(), 1u);
+    FT_ASSERT_EQ(t.copy_of(original.id).logical_size, 123u);
 }
 
 int main() { return ft_test::run_all("test_page_table"); }

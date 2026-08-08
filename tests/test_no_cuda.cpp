@@ -1,6 +1,7 @@
 #include "test_harness.hpp"
 
 #include "flashtier/config.hpp"
+#include "flashtier/backends/cuda_backend.hpp"
 #include "flashtier/error.hpp"
 #include "flashtier/integrity.hpp"
 #include "flashtier/runtime.hpp"
@@ -62,5 +63,30 @@ FT_TEST(cpu_only_runtime_reports_unsupported_for_vram_residency) {
     rt.free_page(id);
     rt.shutdown();
 }
+
+#if !FLASHTIER_HAVE_CUDA
+
+FT_TEST(cuda_stub_never_silently_succeeds) {
+    CudaBackend backend;
+    FT_ASSERT(backend.enumerate_devices().empty());
+    FT_ASSERT(!backend.probe_capabilities().backend_available);
+    FT_ASSERT_THROWS(backend.open(0), ErrorCode::Unsupported);
+    FT_ASSERT_THROWS(backend.device_info(), ErrorCode::Unsupported);
+    FT_ASSERT_THROWS(backend.capabilities(), ErrorCode::Unsupported);
+    FT_ASSERT_THROWS(backend.allocate(4096), ErrorCode::Unsupported);
+    FT_ASSERT_THROWS(backend.allocate_host_pinned(4096), ErrorCode::Unsupported);
+    FT_ASSERT_THROWS(backend.allocate_unified(4096), ErrorCode::Unsupported);
+    FT_ASSERT_THROWS(backend.create_stream(), ErrorCode::Unsupported);
+    FT_ASSERT_THROWS(backend.create_event(), ErrorCode::Unsupported);
+    FT_ASSERT_THROWS(backend.sync_all(), ErrorCode::Unsupported);
+    backend.free(nullptr);
+    backend.free_host_pinned(nullptr);
+    backend.free_unified(nullptr);
+    backend.destroy_stream(nullptr);
+    backend.destroy_event(nullptr);
+    backend.close();
+}
+
+#endif
 
 int main() { return ft_test::run_all("test_no_cuda"); }

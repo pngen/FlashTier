@@ -13,8 +13,8 @@ void Planner::set_budgets(Budgets budgets) { b_ = budgets; }
 bool Planner::vram_has_headroom(uint64_t need_bytes) const {
     if (b_.vram_limit < b_.vram_reserve) return false;
     const uint64_t usable = b_.vram_limit - b_.vram_reserve;
-    return b_.vram_used <= usable - std::min(need_bytes, usable) &&
-           need_bytes <= usable - b_.vram_used;
+    if (b_.vram_used > usable) return false;
+    return need_bytes <= usable - b_.vram_used;
 }
 
 std::vector<Planner::EvictionDecision> Planner::plan_evictions(
@@ -24,11 +24,15 @@ std::vector<Planner::EvictionDecision> Planner::plan_evictions(
     uint64_t host_free_bytes) const {
     std::vector<EvictionDecision> decisions;
 
-    const uint64_t usable = b_.vram_limit - b_.vram_reserve;
-    if (need_bytes <= usable - b_.vram_used) {
+    const uint64_t usable = b_.vram_limit >= b_.vram_reserve
+                                ? b_.vram_limit - b_.vram_reserve
+                                : 0;
+    const uint64_t headroom = b_.vram_used < usable ? usable - b_.vram_used : 0;
+    if (need_bytes <= headroom) {
         return decisions;  // no eviction needed
     }
-    uint64_t need = need_bytes - (usable - b_.vram_used);
+    uint64_t need = need_bytes - headroom;
+    uint64_t host_remaining = host_free_bytes;
 
     const std::vector<PageId> ordered = policy.rank_victims(resident_vram_candidates);
     std::vector<PageMetadata> by_id;
@@ -50,14 +54,19 @@ std::vector<Planner::EvictionDecision> Planner::plan_evictions(
 
         Tier target = Tier::HostPinned;
         std::string reason = "demote_to_host";
-        if (meta->dirty && host_free_bytes < meta->allocation_size) {
+        if (host_remaining < meta->allocation_size && meta->dirty) {
             // Dirty pages must be persisted before authority moves: stage
             // through host only if room exists; otherwise write to NVMe.
             target = Tier::Nvme;
             reason = "writeback_to_nvme";
-        } else if (!meta->dirty && meta->has_nvme_copy && host_free_bytes < meta->allocation_size) {
+        } else if (host_remaining < meta->allocation_size && meta->has_nvme_copy) {
             target = Tier::Nvme;
             reason = "drop_to_nvme_clean";
+        } else if (host_remaining < meta->allocation_size) {
+            target = Tier::Nvme;
+            reason = "spill_to_nvme";
+        } else {
+            host_remaining -= meta->allocation_size;
         }
 
         decisions.push_back({id, target, reason});
@@ -75,9 +84,11 @@ std::vector<Planner::EvictionDecision> Planner::plan_evictions(
 
 Tier Planner::choose_allocation_tier(uint64_t bytes, bool allow_pageable) const {
     if (vram_has_headroom(bytes)) return Tier::Vram;
-    const uint64_t host_usable = b_.host_limit - b_.host_used;
+    const uint64_t host_usable =
+        b_.host_used < b_.host_limit ? b_.host_limit - b_.host_used : 0;
     if (bytes <= host_usable) return Tier::HostPinned;
-    const uint64_t nvme_usable = b_.nvme_limit - b_.nvme_used;
+    const uint64_t nvme_usable =
+        b_.nvme_used < b_.nvme_limit ? b_.nvme_limit - b_.nvme_used : 0;
     if (bytes <= nvme_usable) return Tier::Nvme;
     (void)allow_pageable;
     throw Error(ErrorCode::Budget,

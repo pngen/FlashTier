@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "flashtier/backends/backend_registry.hpp"
@@ -37,7 +38,7 @@ public:
 
     void open(int device_index) override;
     void close() override;
-    bool is_open() const override { return opened_; }
+    bool is_open() const override;
 
     DeviceInfo device_info() const override;
     DeviceCapabilities capabilities() const override;
@@ -71,17 +72,23 @@ public:
     void wait_event(DeviceEvent* event) override;
     double event_elapsed_us(DeviceEvent* start, DeviceEvent* end) override;
 
-    bool healthy() const override { return opened_; }
+    bool healthy() const override;
     std::string diagnostics() const override;
     std::string last_error() const override;
 
 private:
+    void require_open_locked() const;
+    bool owns_range_locked(const void* ptr, std::size_t bytes) const;
+    void release_owned_resources_locked() noexcept;
+
     mutable std::mutex mu_;
     DeviceInfo info_;
     DeviceCapabilities caps_;
     bool opened_ = false;
     uint64_t allocated_bytes_ = 0;
     std::unordered_map<void*, uint64_t> sizes_;
+    std::unordered_set<DeviceStream*> streams_;
+    std::unordered_set<DeviceEvent*> events_;
 };
 
 void register_cpu_backend(BackendRegistry& registry);

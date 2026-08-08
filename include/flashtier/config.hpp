@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "flashtier/tier.hpp"
@@ -66,6 +67,7 @@ struct Config {
     // Output
     std::string output_dir;      // telemetry directory ("" = cwd)
     std::string jsonl_path;      // explicit JSONL telemetry file
+    bool jsonl_stdout = false;   // also stream JSONL events to stdout
 
     // Automatic budget sizing. Requires detected free resources.
     double auto_vram_fraction = 0.75;
@@ -82,10 +84,11 @@ struct ConfigValidation {
 };
 
     // Validates ranges and internal consistency. Never guesses: malformed or
-    // unsafe values are rejected. `known_backends` is a comma-separated list
-    // of compiled backend names used to validate Config::backend.
-    ConfigValidation validate_config(const Config& cfg,
-                                     const std::vector<std::string>& known_backends = {}) noexcept;
+    // unsafe values are rejected. `known_backends` is the list of compiled
+    // backend names used to validate Config::backend.
+    ConfigValidation validate_config(
+        const Config& cfg,
+        const std::vector<std::string>& known_backends = {});
 
 // Strict byte-size parsing. Accepts an unsigned integer optionally followed
 // by a binary suffix: KiB, MiB, GiB, TiB (case-insensitive). Bare bytes are

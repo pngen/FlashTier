@@ -168,16 +168,35 @@ public:
     virtual void copy_host_to_device_sync(void* dst_device, const void* src_host,
                                           std::size_t bytes) {
         DeviceStream* stream = create_stream();
-        async_copy_host_to_device(dst_device, src_host, bytes, stream);
-        sync_stream(stream);
+        try {
+            async_copy_host_to_device(dst_device, src_host, bytes, stream);
+            sync_stream(stream);
+        } catch (...) {
+            // Preserve the transfer/synchronization failure while still
+            // releasing the helper-owned stream. A cleanup failure must not
+            // replace the causal exception.
+            try {
+                destroy_stream(stream);
+            } catch (...) {
+            }
+            throw;
+        }
         destroy_stream(stream);
     }
 
     virtual void copy_device_to_host_sync(void* dst_host, const void* src_device,
                                           std::size_t bytes) {
         DeviceStream* stream = create_stream();
-        async_copy_device_to_host(dst_host, src_device, bytes, stream);
-        sync_stream(stream);
+        try {
+            async_copy_device_to_host(dst_host, src_device, bytes, stream);
+            sync_stream(stream);
+        } catch (...) {
+            try {
+                destroy_stream(stream);
+            } catch (...) {
+            }
+            throw;
+        }
         destroy_stream(stream);
     }
 };

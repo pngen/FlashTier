@@ -55,7 +55,7 @@ struct PageMetadata {
     uint64_t nvme_offset = kInvalidOffset;  // extent offset in the NVMe store
 
     PageState state = PageState::Unallocated;
-    Tier current_tier = Tier::None;  // derived from state; kept explicit
+    Tier current_tier = Tier::None;  // residency tier (distinguishes pinned/pageable host)
     Tier desired_tier = Tier::None;  // planner's target tier
 
     bool dirty = false;        // authoritative copy diverges from NVMe copy

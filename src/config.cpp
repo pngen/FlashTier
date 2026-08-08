@@ -75,6 +75,10 @@ uint64_t parse_bytesize(const std::string& text) {
     uint64_t multiplier = 1;
     if (i < n) {
         std::string suffix = text.substr(i);
+        while (!suffix.empty() &&
+               std::isspace(static_cast<unsigned char>(suffix.back()))) {
+            suffix.pop_back();
+        }
         // Normalize case.
         for (char& c : suffix) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         if (suffix == "B" || suffix == "BYTES") {
@@ -117,7 +121,7 @@ std::string bytesize_to_string(uint64_t bytes) {
 }
 
 ConfigValidation validate_config(const Config& cfg,
-                                 const std::vector<std::string>& known_backends) noexcept {
+                                 const std::vector<std::string>& known_backends) {
     ConfigValidation out;
     out.ok = true;
 
@@ -138,6 +142,10 @@ ConfigValidation validate_config(const Config& cfg,
             fail("unknown device backend '" + cfg.backend + "'");
         }
     }
+    if (!cfg.cuda_enabled && !cfg.backend.empty() && cfg.backend != "auto" &&
+        cfg.backend != "cpu") {
+        fail("disabled accelerator support conflicts with backend '" + cfg.backend + "'");
+    }
 
     if (cfg.page_size == 0) {
         fail("page size must be nonzero");
@@ -146,13 +154,47 @@ ConfigValidation validate_config(const Config& cfg,
         if (cfg.page_size % 4096 != 0) fail("page size must be a multiple of 4096 bytes");
         if ((cfg.page_size & (cfg.page_size - 1)) != 0) fail("page size must be a power of two");
     }
-    if (cfg.queue_depth == 0) fail("queue depth must be nonzero");
-    if (cfg.prefetch_depth == 0) fail("prefetch depth must be nonzero");
-    if (cfg.iterations == 0) fail("iterations must be nonzero");
-    if (cfg.auto_vram_fraction <= 0.0 || cfg.auto_vram_fraction > 1.0) fail("auto VRAM fraction must be in (0, 1]");
-    if (cfg.auto_host_fraction <= 0.0 || cfg.auto_host_fraction > 0.5) fail("auto host fraction must be in (0, 0.5]");
-    if (cfg.auto_nvme_fraction <= 0.0 || cfg.auto_nvme_fraction > 0.5) fail("auto NVMe fraction must be in (0, 0.5]");
-    if (cfg.vram_reserve_margin < 0.0 || cfg.vram_reserve_margin >= 0.5) fail("VRAM reserve margin must be in [0, 0.5)");
+    if (cfg.queue_depth == 0 || cfg.queue_depth > 1024) {
+        fail("queue depth must be in [1, 1024]");
+    }
+    if (cfg.worker_threads > 1024) fail("worker thread count must not exceed 1024");
+    if (cfg.prefetch_depth == 0 || cfg.prefetch_depth > (1u << 20)) {
+        fail("prefetch depth must be in [1, 1048576]");
+    }
+    if (cfg.iterations == 0 || cfg.iterations > 1000000) {
+        fail("iterations must be in [1, 1000000]");
+    }
+    if (!std::isfinite(cfg.auto_vram_fraction) || cfg.auto_vram_fraction <= 0.0 ||
+        cfg.auto_vram_fraction > 1.0) {
+        fail("auto VRAM fraction must be finite and in (0, 1]");
+    }
+    if (!std::isfinite(cfg.auto_host_fraction) || cfg.auto_host_fraction <= 0.0 ||
+        cfg.auto_host_fraction > 0.5) {
+        fail("auto host fraction must be finite and in (0, 0.5]");
+    }
+    if (!std::isfinite(cfg.auto_nvme_fraction) || cfg.auto_nvme_fraction <= 0.0 ||
+        cfg.auto_nvme_fraction > 0.5) {
+        fail("auto NVMe fraction must be finite and in (0, 0.5]");
+    }
+    if (!std::isfinite(cfg.vram_reserve_margin) || cfg.vram_reserve_margin < 0.0 ||
+        cfg.vram_reserve_margin >= 0.5) {
+        fail("VRAM reserve margin must be finite and in [0, 0.5)");
+    }
+    if (cfg.page_size != 0 &&
+        (cfg.auto_nvme_cap < cfg.page_size || cfg.auto_nvme_cap % cfg.page_size != 0)) {
+        fail("auto NVMe cap must be a nonzero multiple of page size");
+    }
+    switch (cfg.policy) {
+        case PolicyKind::Lru:
+        case PolicyKind::Predictive: break;
+        default: fail("invalid policy kind"); break;
+    }
+    switch (cfg.prefetch) {
+        case PrefetchKind::Off:
+        case PrefetchKind::Sequential:
+        case PrefetchKind::Predictive: break;
+        default: fail("invalid prefetch kind"); break;
+    }
     if (cfg.device_id < 0) fail("device id must be nonnegative");
 
     return out;

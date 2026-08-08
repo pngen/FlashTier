@@ -79,7 +79,7 @@ std::string telemetry_event_to_jsonl(const TelemetryEvent& ev);
 class TelemetrySink {
 public:
     TelemetrySink(std::string human_path, std::string jsonl_path, bool to_stdout);
-    ~TelemetrySink();
+    ~TelemetrySink() noexcept;
 
     TelemetrySink(const TelemetrySink&) = delete;
     TelemetrySink& operator=(const TelemetrySink&) = delete;
@@ -87,7 +87,7 @@ public:
     void emit(TelemetryEvent ev);  // assigns timestamp + sequence
     uint64_t emit_sequenced(TelemetryEvent ev);  // same, returns sequence
     void flush();
-    uint64_t events_emitted() const noexcept { return emitted_; }
+    uint64_t events_emitted() const noexcept;
 
 private:
     mutable std::mutex mu_;

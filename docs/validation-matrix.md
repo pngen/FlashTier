@@ -15,9 +15,9 @@ detected** = the backend's loader/runtime and a device are present;
 |---|---|---|---|---|---|---|---|---|---|---|
 | cuda | NVIDIA | Windows (validated), Linux | yes | yes | yes (RTX 5090, cc 12.0) | yes (18-point battery) | yes (64 MiB) | yes (device→host→NVMe, 2× budget) | no (v0.1) | WDDM: managed-memory prefetch/advice rejected by driver; CAM=no |
 | hip | AMD | Windows/Linux when ROCm installed | gated (requires HIP toolchain) | no (no ROCm on validation machine) | no | no (pending hardware) | no | no | no | source written, not compiled locally |
-| level_zero | Intel | Windows/Linux | yes (runtime-loader, no SDK) | no (no loader/driver) | no | no (pending hardware) | no | no | no | self-declared API surface; not runtime-validated |
-| vulkan | cross-vendor | Windows/Linux | yes (runtime-loader, no SDK; experimental) | no (no loader/driver) | no | no | no | no | no | experimental; storage buffers are not CUDA-compatible VRAM |
-| metal | Apple | macOS | gated (Apple only) | no (Windows host) | no | no | no | no | no | architecture present; not compiled/executed in this pass |
+| level_zero | Intel | Windows/Linux | containment stub | unavailable | no | no | no | no | no | fails closed pending a specification-header-based implementation |
+| vulkan | cross-vendor | Windows/Linux | containment stub | unavailable | no | no | no | no | no | fails closed pending a conforming memory/queue implementation |
+| metal | Apple | macOS | containment stub | unavailable | no | no | no | no | no | fails closed pending a conforming raw-host-pointer implementation |
 | cpu | portable | all | yes | yes | yes | yes | yes | yes (host/NVMe) | n/a | emulation; no GPU execution claimed |
 
 ## Proof sequence per backend
@@ -37,7 +37,7 @@ detected** = the backend's loader/runtime and a device are present;
 ## CUDA validation record (this environment)
 
 - GPU: NVIDIA GeForce RTX 5090, compute capability 12.0, 32 GiB VRAM.
-- Driver 610.82 (CUDA UMD 13.3), toolkit 12.9.86.
+- Driver 610.88, toolkit 12.9.86.
 - Conformance battery: passed on real hardware.
 - Tiny round trip: 16 MiB, byte-for-byte + integrity pattern, zero
   mismatches.
@@ -58,9 +58,10 @@ detected** = the backend's loader/runtime and a device are present;
 ## Untested hardware paths (explicitly not claimed)
 
 - AMD (HIP/ROCm): no ROCm toolchain or AMD GPU on the validation machine.
-- Intel (Level Zero): no Level Zero loader/driver or Intel GPU.
-- Cross-vendor Vulkan: experimental module compiles; no loader/driver.
-- Apple Metal: architecture only; no macOS build environment in this pass.
+- Intel (Level Zero): containment stub only; no usable implementation.
+- Cross-vendor Vulkan: containment stub only; no usable implementation.
+- Apple Metal: containment stub only; no usable implementation or macOS
+  validation environment in this pass.
 - NVIDIA GPUs other than the RTX 5090: not executed here; behavior is
   capability-driven and expected to generalize, but each device family
   requires the same proof sequence before being called validated.

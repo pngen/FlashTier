@@ -1,6 +1,8 @@
 #include "flashtier/cli.hpp"
 
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "flashtier/error.hpp"
 
@@ -86,6 +88,19 @@ bool parse_uint(const std::string& s, uint64_t& out) {
     }
     out = v;
     return true;
+}
+
+bool parse_finite_double(const std::string& s, double& out) {
+    if (s.empty()) return false;
+    try {
+        std::size_t consumed = 0;
+        const double value = std::stod(s, &consumed);
+        if (consumed != s.size() || !std::isfinite(value)) return false;
+        out = value;
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 }  // namespace
@@ -262,7 +277,8 @@ Options parse_args(int argc, char** argv) {
             std::string v;
             if (value_for("--um-prefetch-pages", v)) {
                 uint64_t n = 0;
-                if (!parse_uint(v, n) || n == 0) {
+                if (!parse_uint(v, n) || n == 0 ||
+                    n > std::numeric_limits<uint32_t>::max()) {
                     o.errors.push_back("--um-prefetch-pages expects a positive integer");
                 } else {
                     o.um_prefetch_pages = n;
@@ -271,15 +287,12 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--auto-vram-fraction") {
             std::string v;
             if (value_for("--auto-vram-fraction", v)) {
-                try {
-                    const double d = std::stod(v);
-                    if (d <= 0.0 || d > 1.0) {
-                        o.errors.push_back("--auto-vram-fraction must be in (0, 1]");
-                    } else {
-                        o.auto_vram_fraction = d;
-                    }
-                } catch (...) {
-                    o.errors.push_back("--auto-vram-fraction expects a number");
+                double d = 0.0;
+                if (!parse_finite_double(v, d) || d <= 0.0 || d > 1.0) {
+                    o.errors.push_back(
+                        "--auto-vram-fraction must be a finite number in (0, 1]");
+                } else {
+                    o.auto_vram_fraction = d;
                 }
             }
         } else if (arg == "inspect" || arg == "capabilities" || arg == "verify") {
@@ -326,6 +339,7 @@ Config Options::to_config() const {
     c.seed = seed;
     c.vram_reserve_margin = vram_reserve_margin;
     c.output_dir = output_dir;
+    c.jsonl_stdout = jsonl;
     c.retain_store = retain_store;
     c.strict = strict;
     c.cuda_enabled = !no_cuda;

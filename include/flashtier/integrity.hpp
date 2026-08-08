@@ -11,9 +11,10 @@ namespace flashtier {
 // FNV-1a 64 checksum used for routine telemetry integrity.
 uint64_t fnv1a64(const void* data, std::size_t n, uint64_t seed = 0xC0FFEE) noexcept;
 
-// Deterministic content: each 8-byte block of a page derives from
-// splitmix64(seed ^ page_id ^ block_index). Any run can regenerate the
-// expected data, so full content verification is always possible.
+// Deterministic content: each 8-byte block of a page is the little-endian
+// encoding of splitmix64(seed ^ page_id ^ block_index). Any platform can
+// regenerate the same expected bytes, so full content verification is always
+// possible.
 void fill_pattern(void* dst, std::size_t n, uint64_t seed, uint64_t page_id) noexcept;
 
 struct IntegrityMismatch {

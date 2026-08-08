@@ -15,7 +15,7 @@ int main() {
     Config cfg;
     cfg.cuda_enabled = false;  // CPU-only by default for examples
     cfg.page_size = 64 * 1024;
-    cfg.host_budget_bytes = 4 * 1024 * 1024;   // small on purpose
+    cfg.host_budget_bytes = 4 * cfg.page_size;  // four resident pages
     cfg.nvme_budget_bytes = 32 * 1024 * 1024;
     cfg.policy = PolicyKind::Predictive;
     cfg.output_dir = ".";
@@ -39,10 +39,17 @@ int main() {
         rt.read_page(ids[a.page_id], buf.data());
     }
 
+    const uint64_t vram_pages = rt.pages_resident_vram();
+    const uint64_t host_pages = rt.pages_resident_host();
+    const uint64_t nvme_pages = rt.pages_resident_nvme();
     std::printf("residency after workload: vram=%llu host=%llu nvme=%llu\n",
-                static_cast<unsigned long long>(rt.pages_resident_vram()),
-                static_cast<unsigned long long>(rt.pages_resident_host()),
-                static_cast<unsigned long long>(rt.pages_resident_nvme()));
+                static_cast<unsigned long long>(vram_pages),
+                static_cast<unsigned long long>(host_pages),
+                static_cast<unsigned long long>(nvme_pages));
+    if (nvme_pages == 0) {
+        std::fprintf(stderr, "oversubscription example did not spill any page to NVMe\n");
+        return 1;
+    }
 
     for (PageId id : ids) rt.verify_page(id);
     std::printf("integrity: all %llu pages verified after oversubscription\n",

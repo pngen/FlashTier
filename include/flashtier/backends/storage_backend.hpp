@@ -52,6 +52,14 @@ public:
 
     virtual void free_extent(uint64_t offset) = 0;
 
+    // Allocate/free a contiguous run of extents atomically. The default
+    // implementation preserves compatibility for backends that only support
+    // single-extent operations; multi-extent requests are rejected. A
+    // successful allocation owns every extent in
+    // [offset_out, offset_out + extent_count * page_size).
+    virtual bool allocate_extents(uint64_t extent_count, uint64_t& offset_out);
+    virtual void free_extents(uint64_t offset, uint64_t extent_count);
+
     virtual uint64_t extents_used() const noexcept = 0;
 
     // Async reads/writes. The operation runs in the backend and completes

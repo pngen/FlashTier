@@ -7,6 +7,10 @@
 #include "flashtier/backends/cuda_backend.hpp"
 #include "flashtier/error.hpp"
 #include "flashtier/integrity.hpp"
+#include "flashtier/device_info.hpp"
+#include "flashtier/backends/unified_memory.hpp"
+
+#include <cuda_runtime.h>
 
 using namespace flashtier;
 
@@ -110,6 +114,100 @@ FT_TEST(cuda_backend_typed_errors) {
     FT_ASSERT_THROWS(backend.allocate(caps.max_allocation_size + 1), ErrorCode::Budget);
     FT_ASSERT_THROWS(backend.open(999), ErrorCode::Config);
     backend.close();
+}
+
+FT_TEST(system_probe_preserves_callers_cuda_device) {
+    CudaBackend backend;
+    if (backend.enumerate_devices().empty()) {
+        std::printf("SKIP: no CUDA device available\n");
+        return;
+    }
+    FT_ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    int before = -1;
+    FT_ASSERT_EQ(cudaGetDevice(&before), cudaSuccess);
+    (void)probe_system(0, "");
+    int after = -1;
+    FT_ASSERT_EQ(cudaGetDevice(&after), cudaSuccess);
+    FT_ASSERT_EQ(after, before);
+}
+
+FT_TEST(cuda_backend_rejects_closed_and_out_of_bounds_operations) {
+    CudaBackend backend;
+    if (backend.enumerate_devices().empty()) {
+        std::printf("SKIP: no CUDA device available\n");
+        return;
+    }
+    FT_ASSERT_THROWS(backend.allocate(16), ErrorCode::State);
+    FT_ASSERT_THROWS(backend.create_stream(), ErrorCode::State);
+    backend.open(0);
+    void* allocation = backend.allocate(16);
+    std::vector<uint8_t> host(17, 0x5A);
+    FT_ASSERT_THROWS(
+        backend.async_copy_host_to_device(allocation, host.data(), host.size(), nullptr),
+        ErrorCode::InvalidArgument);
+    FT_ASSERT_THROWS(
+        backend.async_copy_device_to_host(host.data(), allocation, host.size(), nullptr),
+        ErrorCode::InvalidArgument);
+    backend.free(allocation);
+    FT_ASSERT_THROWS(backend.free(allocation), ErrorCode::State);
+    backend.close();
+}
+
+FT_TEST(cuda_backend_close_reclaims_live_owned_resources) {
+    CudaBackend backend;
+    if (backend.enumerate_devices().empty()) {
+        std::printf("SKIP: no CUDA device available\n");
+        return;
+    }
+    backend.open(0);
+    void* device = backend.allocate(4096);
+    void* host = backend.allocate_host_pinned(4096);
+    DeviceStream* stream = backend.create_stream();
+    DeviceEvent* event = backend.create_event();
+    void* unified = nullptr;
+    if (backend.capabilities().unified_memory) {
+        unified = backend.allocate_unified(4096);
+    }
+    backend.close();  // owns and releases all still-live resources
+
+    backend.open(0);
+    FT_ASSERT_THROWS(backend.free(device), ErrorCode::State);
+    FT_ASSERT_THROWS(backend.free_host_pinned(host), ErrorCode::State);
+    FT_ASSERT_THROWS(backend.destroy_stream(stream), ErrorCode::State);
+    FT_ASSERT_THROWS(backend.destroy_event(event), ErrorCode::State);
+    if (unified != nullptr) {
+        FT_ASSERT_THROWS(backend.free_unified(unified), ErrorCode::State);
+    }
+    backend.close();
+}
+
+FT_TEST(cuda_unified_memory_multi_iteration_integrity) {
+    CudaBackend backend;
+    if (backend.enumerate_devices().empty()) {
+        std::printf("SKIP: no CUDA device available\n");
+        return;
+    }
+    backend.open(0);
+    const bool unified = backend.capabilities().unified_memory;
+    backend.close();
+    if (!unified) {
+        std::printf("SKIP: CUDA managed memory unavailable\n");
+        return;
+    }
+
+    constexpr uint64_t kWorkingSet = 4ull * 1024 * 1024;
+    constexpr uint64_t kPageSize = 64ull * 1024;
+    const UmResult result = run_unified_memory_benchmark(
+        0, kWorkingSet, kPageSize, 8, 2, 0xC0FFEE);
+    FT_ASSERT_EQ(result.ops, 128u);
+    FT_ASSERT_EQ(result.bytes_moved, result.ops * sizeof(uint64_t));
+    FT_ASSERT_EQ(result.mismatches, 0u);
+    FT_ASSERT_THROWS(
+        run_unified_memory_benchmark(0, kWorkingSet, kPageSize, 8, 0, 1),
+        ErrorCode::InvalidArgument);
+    FT_ASSERT_THROWS(
+        run_unified_memory_benchmark(0, 4096, 7, 8, 1, 1),
+        ErrorCode::InvalidArgument);
 }
 
 #else

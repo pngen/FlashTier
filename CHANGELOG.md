@@ -44,9 +44,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Unified Memory comparison.
 - Examples: `minimal_tiered_buffer`, `oversubscribed_working_set`.
 - CPU-only build mode with full core unit test coverage.
-- CMake presets for Windows CUDA debug/release, Windows CPU release, Linux
-  CUDA/CPU release; GitHub Actions workflows for CPU-only CI on both
-  platforms with gated CUDA jobs.
+- CMake presets for Windows CUDA debug/release, Windows CPU release, and
+  Linux CUDA/CPU release.
 - Licensing and governance: Apache License 2.0, NOTICE, CONTRIBUTING,
   CODE_OF_CONDUCT, SECURITY, README, ARCHITECTURE, ROADMAP, BENCHMARKS.
 
@@ -58,4 +57,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   see ROADMAP.md).
 - Windows WDDM disables `concurrentManagedAccess` on many systems; the
   runtime reports capability truthfully and uses explicit copies.
+- Level Zero, Vulkan, and Metal fail closed until conforming backend
+  implementations pass their hardware proof sequences.
 - No real-model inference integration yet (research only).

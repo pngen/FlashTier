@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,20 @@ std::string gb(double bytes) {
 }
 
 std::string yes_no(bool v) { return v ? "yes" : "no"; }
+
+int exit_for_error(const Error& e) {
+    switch (e.code()) {
+        case ErrorCode::Config:
+        case ErrorCode::InvalidArgument:
+        case ErrorCode::Budget: return cli::kExitUsage;
+        case ErrorCode::StoreCorrupt: return cli::kExitCorrupt;
+        case ErrorCode::Unsupported: return cli::kExitUnsupported;
+        case ErrorCode::Integrity: return cli::kExitIntegrity;
+        case ErrorCode::Cuda:
+        case ErrorCode::Io: return cli::kExitFatal;
+        default: return cli::kExitError;
+    }
+}
 
 void print_device_line(const DeviceInfo& d) {
     std::printf("    %-14s %-32s arch=%-10s discrete=%s shared_mem=%s total=%s free=%s\n",
@@ -63,6 +78,14 @@ void print_backends(const BackendRegistry& registry) {
 // inspect/capabilities). Returns the backend name; "cpu" means CPU-only.
 std::string resolve_selected_backend(const cli::Options& o, std::string& reason) {
     BackendRegistry& registry = BackendRegistry::instance();
+    if (o.no_cuda) {
+        if (!o.backend.empty() && o.backend != "auto" && o.backend != "cpu") {
+            throw Error(ErrorCode::Config,
+                        "--no-cuda conflicts with explicit backend '" + o.backend + "'");
+        }
+        reason = "CPU-only mode requested (--no-cuda)";
+        return "cpu";
+    }
     if (!o.backend.empty() && o.backend != "auto") {
         if (!registry.has(o.backend)) {
             throw Error(ErrorCode::Config,
@@ -180,6 +203,9 @@ int run_inspect(const cli::Options& o) {
         return cli::kExitOk;
     } catch (const Error& e) {
         std::fprintf(stderr, "flashtier: inspect failed: %s\n", e.what());
+        return exit_for_error(e);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "flashtier: inspect failed: %s\n", e.what());
         return cli::kExitError;
     }
 }
@@ -190,6 +216,9 @@ int run_capabilities(const cli::Options& o) {
         print_capabilities(info, o);
         return cli::kExitOk;
     } catch (const Error& e) {
+        std::fprintf(stderr, "flashtier: capabilities failed: %s\n", e.what());
+        return exit_for_error(e);
+    } catch (const std::exception& e) {
         std::fprintf(stderr, "flashtier: capabilities failed: %s\n", e.what());
         return cli::kExitError;
     }
@@ -208,9 +237,10 @@ int run_verify(const cli::Options& o) {
         rt.start();
         std::printf("config:\n%s\n", cfg.describe().c_str());
 
-        const uint64_t page_count = cfg.working_set_bytes / cfg.page_size == 0
-                                        ? 64
-                                        : cfg.working_set_bytes / cfg.page_size;
+        const uint64_t page_count =
+            cfg.working_set_bytes == 0
+                ? 64
+                : 1 + (cfg.working_set_bytes - 1) / cfg.page_size;
         std::printf("verifying %llu pages through full promote/demote cycles\n",
                     static_cast<unsigned long long>(page_count));
 
@@ -248,7 +278,10 @@ int run_verify(const cli::Options& o) {
         std::fprintf(stderr, "flashtier: verify failed: %s", e.what());
         if (!e.detail().empty()) std::fprintf(stderr, " (%s)", e.detail().c_str());
         std::fprintf(stderr, "\n");
-        return e.code() == ErrorCode::Integrity ? cli::kExitIntegrity : cli::kExitError;
+        return exit_for_error(e);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "flashtier: verify failed: %s\n", e.what());
+        return cli::kExitError;
     }
 }
 
