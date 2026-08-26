@@ -2,8 +2,8 @@ FlashTier
 
 Copyright © Summon Software Labs
 
-FlashTier is an open-source heterogeneous-memory runtime that governs AI
-workload residency across GPU VRAM, system RAM, and NVMe storage.
+FlashTier is an open-source, vendor-neutral heterogeneous-memory runtime that
+governs AI workload residency across GPU VRAM, system RAM, and NVMe storage.
 
 This product is licensed under the Apache License, Version 2.0. See the
 LICENSE file in this distribution for the full license text.
