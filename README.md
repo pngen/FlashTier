@@ -324,43 +324,6 @@ The purpose is mechanism comparison — what each strategy does under the
 same bounded load — not a performance-superiority claim, and Unified
 Memory is not FlashTier's implementation mechanism.
 
-## Current limitations (v0.1)
-
-- CUDA is the only hardware-validated GPU backend; validation covers the
-  RTX 5090 (Blackwell sm_120) on Windows.
-- Single GPU; no multi-GPU placement.
-- NVMe transport is staged through pinned host memory; no DirectStorage
-  or GPUDirect Storage data path.
-- Generic byte regions only; no tensor metadata adapter, real-model
-  inference adapter, or framework integration (llama.cpp, PyTorch, vLLM
-  research only, see [ROADMAP.md](ROADMAP.md)).
-- No hardware validation yet for AMD or Linux CUDA, or for NVIDIA
-  architectures other than sm_120 on the RTX 5090. Level Zero, Vulkan, and
-  Metal intentionally fail closed pending conforming implementations.
-- Windows WDDM imposes implicit synchronization and disallows
-  `concurrentManagedAccess` on many systems; the runtime uses explicit
-  copies and reports capabilities truthfully.
-- The public API and backend ABI are v0.1 and subject to change.
-
-HIP is implemented and compile-gated (not "not implemented"): it awaits a
-ROCm toolchain and AMD hardware to run the same proof sequence.
-
-## Version status
-
-FlashTier v0.1.0 is the first hardware-proven proof-of-concept release of
-the governed heterogeneous-memory mechanism. It is not production-ready,
-and it is not merely experimental scaffolding: the mechanism has survived
-real device-memory oversubscription with exact integrity on actual GPU
-hardware. The founder determines when development is complete.
-
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
-Copyright 2026 Paul Ngen.
-
-## Contributing
-
-Start with [CONTRIBUTING.md](CONTRIBUTING.md). No CLA is required; the
-security policy is in [SECURITY.md](SECURITY.md), the conduct policy in
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), and methodology for benchmark
-results in [BENCHMARKS.md](BENCHMARKS.md).
+Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
